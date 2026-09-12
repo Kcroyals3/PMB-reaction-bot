@@ -60,14 +60,37 @@ message_index = {}
 # guild_id -> role_id (the "roster")
 rosters = {}
 
-# guild_id -> most recent event_id
-last_event = {}
+# guild_id -> [event_id, ...], oldest first. A server can have several RSVPs
+# running at once; /summary and /reactping pick between them by title.
+guild_events = {}
+
+# Creating one past this closes the oldest. A rolling window rather than a hard
+# refusal, so /rsvp never fails on a cap the person wasn't thinking about.
+MAX_ACTIVE_RSVPS = 3
 
 # set of (message_id, emoji) where the bot currently holds a seed reaction
 bot_seeded = set()
 
 # guild_id -> list of "HH:MM" (24hr) time strings, custom per server
 guild_times = {}
+
+# What the bot does with its own placeholder reactions.
+#   CLEAR — drop the bot's reaction as soon as a real person picks that option,
+#           so the visible count is exactly the number of people.
+#   KEEP  — leave all three in place forever. Every count reads one higher than
+#           the real number, but the options can never vanish, so they never
+#           fall out of ✅ ❌ ❓ order.
+# Either way the bot is excluded from the tally, so it never appears in the
+# summary image or in /reactping.
+KEEP_PLACEHOLDERS = "keep"
+CLEAR_PLACEHOLDERS = "clear"
+
+# guild_id -> one of the two above
+guild_seed_mode = {}
+
+
+def keeps_placeholders(guild_id) -> bool:
+    return guild_seed_mode.get(guild_id, CLEAR_PLACEHOLDERS) == KEEP_PLACEHOLDERS
 
 # guild_id -> tzinfo. Named IANA zones rather than fixed offsets, so a server
 # set to Eastern stays correct across the EST/EDT changeover instead of
@@ -837,6 +860,62 @@ async def settimezone(interaction: discord.Interaction, zone: str):
     )
 
 
+@bot.tree.command(
+    name="setreactions",
+    description="Choose whether the bot keeps its own reactions on RSVP messages",
+)
+@app_commands.describe(mode="Keep all three options visible, or clear the bot's own reaction")
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(
+            name="Keep — all three stay visible and never change order",
+            value=KEEP_PLACEHOLDERS,
+        ),
+        app_commands.Choice(
+            name="Clear — counts match the number of people (default)",
+            value=CLEAR_PLACEHOLDERS,
+        ),
+    ]
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setreactions(interaction: discord.Interaction, mode: str):
+    # discord.py hands back either the raw value or the Choice wrapping it,
+    # depending on how the parameter is annotated. Accept either.
+    value = getattr(mode, "value", mode)
+    if value not in (KEEP_PLACEHOLDERS, CLEAR_PLACEHOLDERS):
+        await interaction.response.send_message(
+            "Pick one of the offered options.", ephemeral=True
+        )
+        return
+
+    guild_seed_mode[interaction.guild_id] = value
+
+    if value == KEEP_PLACEHOLDERS:
+        text = (
+            "The bot will **keep** its own ✅ ❌ ❓ on every RSVP message.\n"
+            "• All three stay visible and can never fall out of order.\n"
+            "• Each count on the message reads one higher than the number of "
+            "people, since the bot's own reaction is in it.\n"
+            "• The summary image and `/reactping` still ignore the bot, so "
+            "those numbers are exactly the people who responded."
+        )
+    else:
+        text = (
+            "The bot will **remove** its own reaction as soon as someone picks "
+            "that option.\n"
+            "• Counts on the message are exactly the number of people.\n"
+            "• An option whose last vote is withdrawn vanishes for a moment "
+            "and is re-added, so the bot has to put the three back in order."
+        )
+
+    await interaction.response.send_message(text, ephemeral=True)
+
+    # Bring RSVPs already running into line rather than waiting for whatever
+    # happens to trigger the next repair.
+    for _, event in events_for_guild(interaction.guild_id):
+        run_in_background(repair_event(event, bot.get_channel(event["channel_id"])))
+
+
 @bot.tree.command(name="rsvp", description="Create an RSVP — one message per time slot")
 @app_commands.describe(
     title="What are people RSVPing to?",
@@ -859,6 +938,17 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
 
     time_slots = get_time_slots(interaction.guild_id)
 
+    # The title is how /summary and /reactping tell RSVPs apart, so two running
+    # at once can't share one.
+    for _, existing in events_for_guild(interaction.guild_id):
+        if existing["title"].casefold() == title.strip().casefold():
+            await interaction.response.send_message(
+                f"There's already an RSVP called **{existing['title']}** running. "
+                "Give this one a different title so they can be told apart.",
+                ephemeral=True,
+            )
+            return
+
     try:
         await interaction.response.send_message(f"Creating RSVP for **{title}**...", ephemeral=True)
 
@@ -875,7 +965,7 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
             "tz": tz,
             "slots": slots,
         }
-        last_event[interaction.guild_id] = event_id
+        closed = register_event(interaction.guild_id, event_id)
 
         for time_label in time_slots:
             ts = build_timestamp(time_label, date_str, tz)
@@ -907,6 +997,15 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
         # Narrow races remain between sending a message and indexing it, so
         # read the true state back from Discord and merge in anything missed.
         await reconcile_event(active_events[event_id], interaction.channel)
+
+        if closed:
+            names = ", ".join(f"**{event['title']}**" for event in closed)
+            await interaction.followup.send(
+                f"Closed {names} to stay within {MAX_ACTIVE_RSVPS} running RSVPs. "
+                "Those messages are still in the channel, but reactions on them "
+                "no longer count.",
+                ephemeral=True,
+            )
     except discord.Forbidden:
         await interaction.followup.send(
             "I don't have permission to send messages or add reactions in this channel. "
@@ -940,6 +1039,88 @@ def locate_slot(message_id: int):
     return event["slots"].get(time_label)
 
 
+def events_for_guild(guild_id: int) -> list:
+    """This guild's live RSVPs as (event_id, event), oldest first."""
+    return [
+        (event_id, active_events[event_id])
+        for event_id in guild_events.get(guild_id, [])
+        if event_id in active_events
+    ]
+
+
+def forget_event(event_id: str):
+    """Stop tracking an RSVP and drop every trace of its messages."""
+    event = active_events.pop(event_id, None)
+    if event is None:
+        return None
+
+    for slot in event["slots"].values():
+        message_id = slot["message_id"]
+        message_index.pop(message_id, None)
+        _order_locks.pop(message_id, None)
+        for emoji in STATUS_ORDER:
+            bot_seeded.discard((message_id, emoji))
+    return event
+
+
+def register_event(guild_id: int, event_id: str) -> list:
+    """Track a new RSVP, closing the oldest if that puts the guild over the cap.
+
+    Returns the events that were closed. This is also what keeps message_index
+    and bot_seeded from growing forever in a long-running process.
+    """
+    event_ids = guild_events.setdefault(guild_id, [])
+    event_ids.append(event_id)
+
+    closed = []
+    while len(event_ids) > MAX_ACTIVE_RSVPS:
+        evicted = forget_event(event_ids.pop(0))
+        if evicted is not None:
+            closed.append(evicted)
+    return closed
+
+
+def resolve_event(guild_id: int, title):
+    """Pick the RSVP a command means. Returns ((event_id, event), None) or
+    (None, message) explaining what to do instead."""
+    live = events_for_guild(guild_id)
+    if not live:
+        return None, "No RSVP found. Run `/rsvp` first."
+
+    listing = ", ".join(f"`{event['title']}`" for _, event in live)
+
+    if title is None:
+        if len(live) == 1:
+            return live[0], None
+        return None, (
+            f"There are {len(live)} RSVPs running — say which one you mean: {listing}"
+        )
+
+    needle = title.strip().casefold()
+    exact = [pair for pair in live if pair[1]["title"].casefold() == needle]
+    if len(exact) == 1:
+        return exact[0], None
+
+    partial = [pair for pair in live if needle in pair[1]["title"].casefold()]
+    if len(partial) == 1:
+        return partial[0], None
+    if len(partial) > 1:
+        matches = ", ".join(f"`{event['title']}`" for _, event in partial)
+        return None, f"`{title}` matches more than one RSVP: {matches}"
+
+    return None, f"No RSVP called `{title}`. Running now: {listing}"
+
+
+async def rsvp_title_autocomplete(interaction: discord.Interaction, current: str):
+    """Offer the guild's live RSVP titles as you type."""
+    needle = (current or "").casefold()
+    return [
+        app_commands.Choice(name=event["title"][:100], value=event["title"][:100])
+        for _, event in events_for_guild(interaction.guild_id)
+        if needle in event["title"].casefold()
+    ][:25]
+
+
 # Re-laying the options is a remove-then-add sequence, and Discord rate limits
 # reaction writes hard. A rate-limited add would otherwise leave that option
 # missing until something else happened to re-add it — and since the options go
@@ -960,7 +1141,28 @@ def order_lock(message_id: int) -> asyncio.Lock:
     return lock
 
 
-async def ensure_option_order(channel, slot) -> None:
+async def add_placeholders(message, emojis) -> None:
+    """Put the bot's placeholder on each emoji, in the order given.
+
+    Afterwards bot_seeded tells the truth for every one: present if the
+    placeholder actually landed, absent if it didn't, so a failure is retried
+    later rather than leaving the option permanently unclickable.
+    """
+    for emoji in emojis:
+        key = (message.id, emoji)
+        bot_seeded.discard(key)
+        for attempt in range(REACTION_ADD_ATTEMPTS):
+            try:
+                await message.add_reaction(emoji)
+            except discord.HTTPException:
+                if attempt + 1 < REACTION_ADD_ATTEMPTS:
+                    await asyncio.sleep(REACTION_RETRY_DELAY)
+                continue
+            bot_seeded.add(key)
+            break
+
+
+async def ensure_option_order(channel, slot, keep: bool = False) -> None:
     """Lay the three options out on the slot's message in STATUS_ORDER.
 
     Discord orders reactions by when each emoji was first added, and an emoji
@@ -993,6 +1195,17 @@ async def ensure_option_order(channel, slot) -> None:
             for reaction in message.reactions
             if str(reaction.emoji) in STATUS_EMOJIS
         ]
+
+        if keep:
+            # The placeholders never come off, so no option can drop to zero
+            # and vanish, and the order can't drift. Nothing to re-lay — just
+            # replace anything that went missing (a failed add, or a manual
+            # removal by an admin).
+            missing = [emoji for emoji in STATUS_ORDER if emoji not in current]
+            if missing:
+                await add_placeholders(message, missing)
+            return
+
         # An option with real votes is anchored; the rest are ours to re-lay.
         movable = [emoji for emoji in STATUS_ORDER if not slot["votes"].get(emoji)]
         anchored = [emoji for emoji in current if emoji not in movable]
@@ -1009,21 +1222,8 @@ async def ensure_option_order(channel, slot) -> None:
                 pass
             bot_seeded.discard((message.id, emoji))
 
-        # Every option this drops must come back. Retry rather than leaving a
-        # hole, and only mark it seeded once the placeholder actually landed,
-        # so a genuine failure is retried later instead of looking done.
-        for emoji in movable:
-            key = (message.id, emoji)
-            bot_seeded.discard(key)
-            for attempt in range(REACTION_ADD_ATTEMPTS):
-                try:
-                    await message.add_reaction(emoji)
-                except discord.HTTPException:
-                    if attempt + 1 < REACTION_ADD_ATTEMPTS:
-                        await asyncio.sleep(REACTION_RETRY_DELAY)
-                    continue
-                bot_seeded.add(key)
-                break
+        # Every option this dropped must come back, in order.
+        await add_placeholders(message, movable)
 
 
 async def read_reaction_voters(reaction) -> set:
@@ -1080,7 +1280,7 @@ async def reconcile_slot(channel, slot: dict) -> None:
     slot["votes"] = votes
 
 
-async def repair_slot(channel, slot: dict) -> None:
+async def repair_slot(channel, slot: dict, keep: bool = False) -> None:
     """Write path: drop spent placeholders and restore the option order.
 
     Kept separate from the read above because these are reaction writes, and
@@ -1094,7 +1294,7 @@ async def repair_slot(channel, slot: dict) -> None:
         else None
     )
 
-    if message is not None:
+    if message is not None and not keep:
         for emoji in STATUS_ORDER:
             key = (slot["message_id"], emoji)
             if slot["votes"].get(emoji) and key in bot_seeded:
@@ -1106,7 +1306,7 @@ async def repair_slot(channel, slot: dict) -> None:
                 except discord.HTTPException:
                     pass
 
-    await ensure_option_order(channel, slot)
+    await ensure_option_order(channel, slot, keep)
 
 
 async def reconcile_event(event: dict, channel, repair: bool = True) -> None:
@@ -1140,8 +1340,9 @@ async def repair_event(event: dict, channel) -> None:
     if channel is None:
         return
 
+    keep = keeps_placeholders(event["guild_id"])
     await asyncio.gather(
-        *(repair_slot(channel, slot) for slot in event["slots"].values()),
+        *(repair_slot(channel, slot, keep) for slot in event["slots"].values()),
         return_exceptions=True,
     )
 
@@ -1170,7 +1371,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # count. Claim the key before awaiting: several people reacting at once
     # would otherwise each fire their own removal request.
     key = (payload.message_id, emoji)
-    if key not in bot_seeded:
+    if keeps_placeholders(payload.guild_id) or key not in bot_seeded:
         return
     bot_seeded.discard(key)
 
@@ -1204,19 +1405,24 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     # message. Re-lay the placeholders rather than adding the one back: a
     # re-added emoji lands at the end, which is what knocked ✅ ❌ ❓ out of
     # order. ensure_option_order owns bot_seeded for the options it touches.
-    await ensure_option_order(bot.get_channel(payload.channel_id), slot)
+    await ensure_option_order(
+        bot.get_channel(payload.channel_id),
+        slot,
+        keeps_placeholders(payload.guild_id),
+    )
 
 
 @bot.tree.command(name="reactping", description="Ping roster members missing a reaction on any time slot")
-async def reactping(interaction: discord.Interaction):
+@app_commands.describe(title="Which RSVP — leave blank if only one is running")
+@app_commands.autocomplete(title=rsvp_title_autocomplete)
+async def reactping(interaction: discord.Interaction, title: str = None):
     guild_id = interaction.guild_id
 
-    event_id = last_event.get(guild_id)
-    if event_id is None or event_id not in active_events:
-        await interaction.response.send_message(
-            "No RSVP found to check. Run `/rsvp` first.", ephemeral=True
-        )
+    found, problem = resolve_event(guild_id, title)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
         return
+    _event_id, event = found
 
     role_id = rosters.get(guild_id)
     if role_id is None:
@@ -1231,8 +1437,6 @@ async def reactping(interaction: discord.Interaction):
             "Roster role not found (was it deleted?).", ephemeral=True
         )
         return
-
-    event = active_events[event_id]
 
     # Resync before naming names — pinging someone who did respond, because
     # their reaction was missed, is worse than the command being a bit slow.
@@ -1271,19 +1475,17 @@ async def reactping(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="summary", description="Generate a shareable image of all RSVP responses")
-async def summary(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-
-    event_id = last_event.get(guild_id)
-    if event_id is None or event_id not in active_events:
-        await interaction.response.send_message(
-            "No RSVP found to summarize. Run `/rsvp` first.", ephemeral=True
-        )
+@app_commands.describe(title="Which RSVP — leave blank if only one is running")
+@app_commands.autocomplete(title=rsvp_title_autocomplete)
+async def summary(interaction: discord.Interaction, title: str = None):
+    found, problem = resolve_event(interaction.guild_id, title)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
         return
+    _event_id, event = found
 
     await interaction.response.defer()
 
-    event = active_events[event_id]
     channel = bot.get_channel(event["channel_id"])
 
     # Read the true state so the image reflects Discord, but skip the reaction

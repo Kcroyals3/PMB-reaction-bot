@@ -14,7 +14,9 @@ The server's timezone leads, so everyone sees the same time when comparing slots
 title — what people are RSVPing to (e.g. "Movie Night")
 date (optional) — YYYY-MM-DD, defaults to today
 
-Each message gets ✅ (yes), ❌ (no), and ❓ (maybe) reactions. The bot seeds all three so people can click them, and automatically removes/re-adds its own seed reaction so the count always reflects real responses, not the bot's own placeholder.
+Each message gets ✅ (yes), ❌ (no), and ❓ (maybe) reactions. The bot seeds all three so people can click them — see /setreactions for what it does with its own reaction afterwards.
+
+Up to 3 RSVPs can run at once per server. Creating a fourth closes the oldest, and you're told which one. Two running at the same time can't share a title, because the title is how /summary and /reactping tell them apart.
 
 /settimes <times>
 
@@ -38,9 +40,21 @@ Fixed UTC offsets are deliberately not accepted: an offset can't know about dayl
 
 This is a server-wide setting, not per-user — one admin sets it and it applies to everyone in the guild. Requires Manage Server permission.
 
-/summary
+/setreactions <mode>
+
+Chooses what the bot does with its own placeholder reactions. Requires Manage Server permission.
+
+Clear (default) — the bot removes its own reaction the moment a real person picks that option, so the count on the message is exactly the number of people. The cost: when the last vote on an option is withdrawn, that option briefly disappears from the message and has to be re-added, which puts it at the end, so the bot has to re-lay all three to keep them in order.
+
+Keep — the bot leaves all three reactions in place permanently. Every count reads one higher than the real number, but the options can never vanish and so can never fall out of ✅ ❌ ❓ order.
+
+Either way the bot is excluded from the tally, so it never appears in the summary image or counts toward /reactping.
+
+/summary [title]
 
 Renders a shareable PNG of every time slot with each responder's avatar and name, grouped into Yes / No / Maybe, and badges the slot with the most yes votes.
+
+title picks which RSVP when more than one is running — it autocompletes, and matches case-insensitively on a partial name. Leave it blank when only one is running.
 
 Because it's an image rather than Discord markdown, it cannot localize per viewer the way /rsvp messages do — so it states its timezone in the header ("all times EDT"). Everyone sees the server's timezone.
 
@@ -48,9 +62,9 @@ Because it's an image rather than Discord markdown, it cannot localize per viewe
 
 Sets which role counts as "the roster" for /reactping. Requires Manage Server permission.
 
-/reactping
+/reactping [title]
 
-Pings everyone in the roster who hasn't reacted to every time slot of the most recent /rsvp. Requires a roster to be set first.
+Pings everyone in the roster who hasn't reacted to every time slot. Requires a roster to be set first. title works the same as on /summary.
 
 Setup
 Install dependencies:
@@ -73,5 +87,5 @@ Connect the repo to a Railway service.
 Add DISCORD_TOKEN under the service's Variables tab.
 Railway auto-redeploys on every push to the connected branch.
 Notes
-Settings (/settimes, /settimezone, /setroster) and RSVP data are stored in memory — they reset if the bot restarts.
-One RSVP "event" is tracked at a time per server for /reactping (the most recent /rsvp run).
+Settings (/settimes, /settimezone, /setroster, /setreactions) and RSVP data are stored in memory — they reset if the bot restarts.
+Up to 3 RSVPs are tracked per server at once; creating a fourth closes the oldest and stops tracking reactions on its messages.
