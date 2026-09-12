@@ -1,4 +1,4 @@
-MBL Reaction Bot
+PMB Reaction Bot
 
 A Discord bot for scheduling RSVPs with per-time-slot voting. Posts one message per time slot, lets people react ✅ / ❌ / ❓, and can ping anyone on a roster who hasn't responded to every slot.
 
