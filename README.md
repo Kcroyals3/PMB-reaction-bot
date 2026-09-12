@@ -5,7 +5,11 @@ A Discord bot for scheduling RSVPs with per-time-slot voting. Posts one message 
 Commands
 /rsvp <title> [date]
 
-Posts one message per time slot. Each message shows the time as a Discord timestamp (<t:...:t>), so it automatically displays in each reader's own local timezone — no confusion across time zones.
+Posts one message per time slot, formatted as:
+
+**Movie Night — 8:00 PM EDT**  ·  your local time: 5:00 PM
+
+The server's timezone leads, so everyone sees the same time when comparing slots or quoting one back to each other. The trailing time is a Discord timestamp (<t:...:t>), which Discord renders in each reader's own timezone.
 
 title — what people are RSVPing to (e.g. "Movie Night")
 date (optional) — YYYY-MM-DD, defaults to today

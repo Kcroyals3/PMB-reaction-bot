@@ -826,7 +826,14 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
 
         for time_label in time_slots:
             ts = build_timestamp(time_label, date_str, tz)
-            message = await interaction.channel.send(f"**{title} — <t:{ts}:t>**")
+            # The server's own clock leads, so everyone reads the same time
+            # when comparing slots or quoting one back. The <t:...> timestamp
+            # trails it and is rendered by Discord in each reader's timezone,
+            # which is the one thing an image summary can never do.
+            message = await interaction.channel.send(
+                f"**{title} — {format_slot_time(ts, tz)} {format_zone_label(ts, tz)}**"
+                f"  ·  your local time: <t:{ts}:t>"
+            )
 
             # Index the slot BEFORE seeding its reactions, so someone clicking
             # the instant the message appears is recorded rather than dropped.
