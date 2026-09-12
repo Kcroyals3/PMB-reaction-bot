@@ -87,7 +87,10 @@ except (ZoneInfoNotFoundError, ValueError):
         f"Install the 'tzdata' package.",
         flush=True,
     )
-    DEFAULT_TZ = timezone(timedelta(hours=-5), "EST")
+    # Deliberately NOT named "EST": in this state the offset is frozen, so
+    # calling it EST in July would be a plausible-looking lie. "UTC-5" on a
+    # summary image is the visible sign that this fallback is active.
+    DEFAULT_TZ = timezone(timedelta(hours=-5), "UTC-5")
 
 
 def get_time_slots(guild_id: int) -> list:
@@ -99,20 +102,16 @@ def get_timezone(guild_id: int):
 
 
 def resolve_timezone(value: str):
-    """Accept either an IANA name ('America/New_York') or a UTC offset ('-4')."""
-    value = value.strip()
-    try:
-        return ZoneInfo(value)
-    except (ZoneInfoNotFoundError, ValueError):
-        pass
+    """Resolve an IANA zone name, or None if it isn't one.
 
+    Fixed UTC offsets are deliberately not accepted. An offset can't know about
+    daylight saving, so '-5' would be an hour wrong from March to November —
+    and silently, which is the worst way to be wrong about a meeting time.
+    """
     try:
-        offset = float(value)
-    except ValueError:
+        return ZoneInfo(value.strip())
+    except (ZoneInfoNotFoundError, ValueError):
         return None
-    if not -14 <= offset <= 14:
-        return None
-    return timezone(timedelta(hours=offset))
 
 
 def describe_timezone(tz) -> str:
@@ -122,24 +121,53 @@ def describe_timezone(tz) -> str:
     return datetime.now(tz).strftime("UTC%z")
 
 
-def parse_hhmm(value: str):
-    """Parse an 'H:MM' or 'HH:MM' 24-hour string into (hour, minute), or None if invalid."""
-    parts = value.strip().split(":")
-    if len(parts) != 2:
-        return None
+def parse_time(value: str):
+    """Parse a time into (hour, minute), or None if it can't be read.
+
+    Accepts 24-hour ('20:00', '9:30') and the way people actually write times
+    ('9pm', '8:30 PM', '8 p.m.'). Bare numbers are read as 24-hour, so '9' is
+    9 AM and '21' is 9 PM — which is why /settimes echoes what it parsed.
+    """
+    text = value.strip().lower().replace(".", "").replace(" ", "")
+
+    meridiem = None
+    if text.endswith("am") or text.endswith("pm"):
+        meridiem, text = text[-2:], text[:-2]
+    elif text.endswith("a") or text.endswith("p"):
+        meridiem, text = text[-1] + "m", text[:-1]
+
+    hour_text, _, minute_text = text.partition(":")
     try:
-        hour = int(parts[0])
-        minute = int(parts[1])
+        hour = int(hour_text)
+        minute = int(minute_text) if minute_text else 0
     except ValueError:
         return None
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+
+    if not 0 <= minute <= 59:
         return None
+
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    elif not 0 <= hour <= 23:
+        return None
+
     return hour, minute
+
+
+def format_label(label: str) -> str:
+    """Render a stored 'HH:MM' slot label the way people read times."""
+    parsed = parse_time(label)
+    if parsed is None:
+        return label
+    hour, minute = parsed
+    return f"{hour % 12 or 12}:{minute:02d} {'AM' if hour < 12 else 'PM'}"
 
 
 def build_timestamp(time_label: str, date_str: str, tz) -> int:
     """Convert a time label + date string + timezone into a Unix timestamp."""
-    hour, minute = parse_hhmm(time_label)
+    hour, minute = parse_time(time_label)
     year, month, day = (int(p) for p in date_str.split("-"))
     dt = datetime(year, month, day, hour, minute, tzinfo=tz)
     return int(dt.timestamp())
@@ -721,7 +749,16 @@ def build_summary_image(
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"Logged in as {bot.user}")
+    # State the resolved timezone at startup, so "is it on Eastern?" is
+    # answerable from the logs instead of by posting an RSVP to find out.
+    # Anything other than EST/EDT here means the tzdata fallback is active.
+    now = int(datetime.now(timezone.utc).timestamp())
+    print(
+        f"Logged in as {bot.user} — default timezone "
+        f"{describe_timezone(DEFAULT_TZ)}, currently "
+        f"{format_zone_label(now, DEFAULT_TZ)} ({format_slot_time(now, DEFAULT_TZ)})",
+        flush=True,
+    )
 
 
 @bot.tree.command(name="setroster", description="Set the role used as the roster for /reactping")
@@ -736,40 +773,56 @@ async def setroster(interaction: discord.Interaction, role: discord.Role):
 
 
 @bot.tree.command(name="settimes", description="Customize the time slots /rsvp uses")
-@app_commands.describe(times="Comma-separated 24hr times, e.g. 18:00,18:30,19:00")
+@app_commands.describe(times="Comma-separated times, e.g. 8pm, 8:30pm, 9pm (24-hour also works)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def settimes(interaction: discord.Interaction, times: str):
-    raw_slots = [t.strip() for t in times.split(",") if t.strip()]
-    if not raw_slots:
+    entries = [t.strip() for t in times.split(",") if t.strip()]
+    if not entries:
         await interaction.response.send_message("Give at least one time.", ephemeral=True)
         return
 
-    for slot in raw_slots:
-        if parse_hhmm(slot) is None:
+    slots = []
+    for entry in entries:
+        parsed = parse_time(entry)
+        if parsed is None:
             await interaction.response.send_message(
-                f"Couldn't parse `{slot}`. Use 24-hour HH:MM, e.g. `18:00,18:30,19:00`.",
+                f"Couldn't read `{entry}`. Write times like `8pm`, `8:30pm` or "
+                "`9 PM` — 24-hour (`20:00`) works too.\n"
+                "For example: `/settimes times:8pm, 8:30pm, 9pm, 9:30pm`",
                 ephemeral=True,
             )
             return
 
-    guild_times[interaction.guild_id] = raw_slots
+        # Stored 24-hour so the label is canonical, and deduplicated because a
+        # slot's data is keyed by this label — two identical entries would post
+        # two messages that then fought over one slot.
+        label = f"{parsed[0]:02d}:{parsed[1]:02d}"
+        if label not in slots:
+            slots.append(label)
+
+    guild_times[interaction.guild_id] = slots
+
+    readable = ", ".join(format_label(label) for label in slots)
+    dropped = len(entries) - len(slots)
+    note = f"\n(Ignored {dropped} duplicate{'' if dropped == 1 else 's'}.)" if dropped else ""
     await interaction.response.send_message(
-        f"Time slots updated: {', '.join(raw_slots)}", ephemeral=True
+        f"Time slots updated to: **{readable}**{note}", ephemeral=True
     )
 
 
 @bot.tree.command(name="settimezone", description="Set the timezone /rsvp times are interpreted in")
-@app_commands.describe(
-    zone="IANA name like America/New_York or America/Chicago, or a fixed UTC offset like -5"
-)
+@app_commands.describe(zone="Timezone name, e.g. America/New_York")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def settimezone(interaction: discord.Interaction, zone: str):
     resolved = resolve_timezone(zone)
     if resolved is None:
         await interaction.response.send_message(
-            f"Couldn't read `{zone}`. Use an IANA name like `America/New_York` "
-            "— preferred, since it handles daylight saving on its own — or a "
-            "fixed UTC offset like `-5`.",
+            f"`{zone}` isn't a timezone name I recognize. Use an IANA name — "
+            "for the US that's `America/New_York`, `America/Chicago`, "
+            "`America/Denver` or `America/Los_Angeles`.\n"
+            "These follow daylight saving on their own, so 8:00 PM stays "
+            "8:00 PM year round. The server already defaults to "
+            f"`{DEFAULT_TIMEZONE}`, so you may not need this at all.",
             ephemeral=True,
         )
         return

@@ -18,9 +18,11 @@ Each message gets ✅ (yes), ❌ (no), and ❓ (maybe) reactions. The bot seeds 
 
 /settimes <times>
 
-Customize the time slots used by /rsvp. Comma-separated, 24-hour format:
+Customize the time slots used by /rsvp. Comma-separated, written however you like:
 
-/settimes times:18:00,18:30,19:00,19:30,20:00
+/settimes times:8pm, 8:30pm, 9pm, 9:30pm, 10pm
+
+12-hour (8pm, 8:30 PM, 8 p.m.) and 24-hour (20:00) are both accepted, and the two can be mixed. A bare number is read as 24-hour, so 9 means 9:00 AM and 21 means 9:00 PM — the confirmation echoes back what was parsed, so a mistake is obvious. Duplicate times are ignored.
 
 Replaces the default slots (20:00, 20:30, 21:00, 21:30, 22:00, 22:30, 23:00 — i.e. 8:00 PM through 11:00 PM) for this server. Requires Manage Server permission.
 
@@ -30,7 +32,11 @@ Sets the timezone used to interpret the times given in /settimes and /rsvp. Defa
 
 /settimezone zone:America/New_York
 
-Prefer an IANA zone name — it handles the EST/EDT changeover automatically, so 8:00 PM stays 8:00 PM year-round. A fixed UTC offset (/settimezone zone:-5) is also accepted, but will be an hour off for part of the year. Requires Manage Server permission.
+Must be an IANA zone name — for the US that's America/New_York, America/Chicago, America/Denver or America/Los_Angeles. These follow daylight saving on their own, so 8:00 PM stays 8:00 PM year-round.
+
+Fixed UTC offsets are deliberately not accepted: an offset can't know about daylight saving, so -5 would be an hour wrong from March to November, silently.
+
+This is a server-wide setting, not per-user — one admin sets it and it applies to everyone in the guild. Requires Manage Server permission.
 
 /summary
 
