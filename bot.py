@@ -74,23 +74,29 @@ bot_seeded = set()
 # guild_id -> list of "HH:MM" (24hr) time strings, custom per server
 guild_times = {}
 
-# What the bot does with its own placeholder reactions.
-#   CLEAR — drop the bot's reaction as soon as a real person picks that option,
-#           so the visible count is exactly the number of people.
-#   KEEP  — leave all three in place forever. Every count reads one higher than
-#           the real number, but the options can never vanish, so they never
-#           fall out of ✅ ❌ ❓ order.
-# Either way the bot is excluded from the tally, so it never appears in the
-# summary image or in /reactping.
+# How people answer an RSVP.
+#   CLEAR   — reactions; the bot drops its own as soon as a real person picks
+#             that option, so the visible count is exactly the people.
+#   KEEP    — reactions; the bot leaves all three in place forever. Counts read
+#             one high, but options can never vanish and so never fall out of
+#             ✅ ❌ ❓ order.
+#   BUTTONS — no reactions at all. Three buttons under the message, with the
+#             tally written into the message itself.
+# In every mode the bot is excluded from the tally, so it never appears in the
+# summary image or counts toward /reactping.
 KEEP_PLACEHOLDERS = "keep"
 CLEAR_PLACEHOLDERS = "clear"
+BUTTON_MODE = "buttons"
+RSVP_MODES = (CLEAR_PLACEHOLDERS, KEEP_PLACEHOLDERS, BUTTON_MODE)
 
-# guild_id -> one of the two above
+# guild_id -> mode. This is the default for RSVPs created from now on; each
+# event records the mode it was built with, because a button message and a
+# reaction message aren't interchangeable once posted.
 guild_seed_mode = {}
 
 
-def keeps_placeholders(guild_id) -> bool:
-    return guild_seed_mode.get(guild_id, CLEAR_PLACEHOLDERS) == KEEP_PLACEHOLDERS
+def guild_mode(guild_id) -> str:
+    return guild_seed_mode.get(guild_id, CLEAR_PLACEHOLDERS)
 
 # guild_id -> tzinfo. Named IANA zones rather than fixed offsets, so a server
 # set to Eastern stays correct across the EST/EDT changeover instead of
@@ -860,29 +866,61 @@ async def settimezone(interaction: discord.Interaction, zone: str):
     )
 
 
+MODE_EXPLANATIONS = {
+    CLEAR_PLACEHOLDERS: (
+        "New RSVPs use **reactions**, and the bot removes its own as soon as "
+        "someone picks that option.\n"
+        "• Counts on the message are exactly the number of people.\n"
+        "• An option whose last vote is withdrawn vanishes for a moment and is "
+        "re-added, so the bot has to put the three back in order."
+    ),
+    KEEP_PLACEHOLDERS: (
+        "New RSVPs use **reactions**, and the bot keeps its own ✅ ❌ ❓ on "
+        "every message.\n"
+        "• All three stay visible and can never fall out of order.\n"
+        "• Each count reads one higher than the number of people, since the "
+        "bot's own reaction is in it."
+    ),
+    BUTTON_MODE: (
+        "New RSVPs use **buttons** instead of reactions.\n"
+        "• Three buttons under each message, with the tally written into the "
+        "message itself and updated on every press.\n"
+        "• Counts are exact and the options can't move or disappear.\n"
+        "• One answer per person per slot — pressing the one you already chose "
+        "clears it.\n"
+        "• Votes live only in memory, so a restart loses them. So does "
+        "everything else here, but reactions at least survive on the message."
+    ),
+}
+
+
 @bot.tree.command(
-    name="setreactions",
-    description="Choose whether the bot keeps its own reactions on RSVP messages",
+    name="setvoting",
+    description="Choose how people answer an RSVP: reactions or buttons",
 )
-@app_commands.describe(mode="Keep all three options visible, or clear the bot's own reaction")
+@app_commands.describe(mode="How people answer, and what the bot does with its own reaction")
 @app_commands.choices(
     mode=[
         app_commands.Choice(
-            name="Keep — all three stay visible and never change order",
+            name="Reactions, clear the bot's own — exact counts (default)",
+            value=CLEAR_PLACEHOLDERS,
+        ),
+        app_commands.Choice(
+            name="Reactions, keep the bot's own — order never shifts, counts read +1",
             value=KEEP_PLACEHOLDERS,
         ),
         app_commands.Choice(
-            name="Clear — counts match the number of people (default)",
-            value=CLEAR_PLACEHOLDERS,
+            name="Buttons — exact counts, fixed order, one answer per person",
+            value=BUTTON_MODE,
         ),
     ]
 )
 @app_commands.checks.has_permissions(manage_guild=True)
-async def setreactions(interaction: discord.Interaction, mode: str):
+async def setvoting(interaction: discord.Interaction, mode: str):
     # discord.py hands back either the raw value or the Choice wrapping it,
     # depending on how the parameter is annotated. Accept either.
     value = getattr(mode, "value", mode)
-    if value not in (KEEP_PLACEHOLDERS, CLEAR_PLACEHOLDERS):
+    if value not in RSVP_MODES:
         await interaction.response.send_message(
             "Pick one of the offered options.", ephemeral=True
         )
@@ -890,30 +928,127 @@ async def setreactions(interaction: discord.Interaction, mode: str):
 
     guild_seed_mode[interaction.guild_id] = value
 
-    if value == KEEP_PLACEHOLDERS:
-        text = (
-            "The bot will **keep** its own ✅ ❌ ❓ on every RSVP message.\n"
-            "• All three stay visible and can never fall out of order.\n"
-            "• Each count on the message reads one higher than the number of "
-            "people, since the bot's own reaction is in it.\n"
-            "• The summary image and `/reactping` still ignore the bot, so "
-            "those numbers are exactly the people who responded."
-        )
-    else:
-        text = (
-            "The bot will **remove** its own reaction as soon as someone picks "
-            "that option.\n"
-            "• Counts on the message are exactly the number of people.\n"
-            "• An option whose last vote is withdrawn vanishes for a moment "
-            "and is re-added, so the bot has to put the three back in order."
-        )
+    # Each RSVP keeps the mode it was created with — a message posted with
+    # buttons can't become a reaction message, or the other way round.
+    running = len(events_for_guild(interaction.guild_id))
+    note = (
+        f"\n\nThe {running} RSVP{'' if running == 1 else 's'} already running "
+        "keep the style they were created with."
+        if running
+        else ""
+    )
 
-    await interaction.response.send_message(text, ephemeral=True)
+    await interaction.response.send_message(
+        MODE_EXPLANATIONS[value] + note + "\n\nIn every mode the bot is left out "
+        "of the tally, so it never shows up in the summary image or counts "
+        "toward `/reactping`.",
+        ephemeral=True,
+    )
 
-    # Bring RSVPs already running into line rather than waiting for whatever
-    # happens to trigger the next repair.
+    # Bring running reaction RSVPs into line with a keep/clear switch rather
+    # than waiting for whatever happens to trigger the next repair.
     for _, event in events_for_guild(interaction.guild_id):
-        run_in_background(repair_event(event, bot.get_channel(event["channel_id"])))
+        if event["mode"] != BUTTON_MODE:
+            event["mode"] = value if value != BUTTON_MODE else event["mode"]
+            run_in_background(
+                repair_event(event, bot.get_channel(event["channel_id"]))
+            )
+
+
+# ---------------------------------------------------------------------------
+# Buttons
+#
+# A button RSVP keeps no state on Discord's side at all: there are no reactions
+# to count, so the tally lives in memory and is written into the message text.
+# That makes the count exact, the three options fixed in place, and the whole
+# placeholder dance unnecessary — at the cost of the votes being gone if the
+# bot restarts, the same as every other setting here.
+# ---------------------------------------------------------------------------
+
+BUTTON_STYLES = {
+    "✅": discord.ButtonStyle.success,
+    "❌": discord.ButtonStyle.danger,
+    "❓": discord.ButtonStyle.secondary,
+}
+
+
+def slot_headline(event: dict, slot: dict) -> str:
+    """Bold server-time headline, with the viewer-localized time trailing it."""
+    ts = slot["timestamp"]
+    tz = event["tz"]
+    return (
+        f"**{event['title']} — {format_slot_time(ts, tz)} {format_zone_label(ts, tz)}**"
+        f"  ·  your local time: <t:{ts}:t>"
+    )
+
+
+def button_message_text(event: dict, slot: dict) -> str:
+    """Headline plus the tally, since buttons carry no count of their own."""
+    tally = "   ".join(f"{emoji} {len(slot['votes'][emoji])}" for emoji in STATUS_ORDER)
+    return f"{slot_headline(event, slot)}\n{tally}"
+
+
+class RSVPButton(discord.ui.Button):
+    def __init__(self, event_id: str, time_label: str, status: str):
+        super().__init__(
+            style=BUTTON_STYLES[status],
+            label=STATUS_EMOJIS[status],
+            emoji=status,
+            custom_id=f"rsvp:{event_id}:{time_label}:{status}",
+        )
+        self.event_id = event_id
+        self.time_label = time_label
+        self.status = status
+
+    async def callback(self, interaction: discord.Interaction):
+        await record_button_vote(
+            interaction, self.event_id, self.time_label, self.status
+        )
+
+
+class RSVPView(discord.ui.View):
+    def __init__(self, event_id: str, time_label: str):
+        super().__init__(timeout=None)
+        for status in STATUS_ORDER:
+            self.add_item(RSVPButton(event_id, time_label, status))
+
+
+async def record_button_vote(
+    interaction: discord.Interaction, event_id: str, time_label: str, status: str
+) -> None:
+    """Apply a button press and rewrite the tally on the message."""
+    event = active_events.get(event_id)
+    slot = event["slots"].get(time_label) if event else None
+    if slot is None:
+        await interaction.response.send_message(
+            "That RSVP has closed — it isn't being tracked any more.", ephemeral=True
+        )
+        return
+
+    user_id = interaction.user.id
+    clearing = user_id in slot["votes"][status]
+
+    # A button answer is exclusive, unlike reactions: clear the other two
+    # rather than letting one person sit in both Yes and Maybe. Pressing the
+    # button you already chose clears your answer entirely.
+    for emoji in STATUS_ORDER:
+        slot["votes"][emoji].discard(user_id)
+    if not clearing:
+        slot["votes"][status].add(user_id)
+
+    when = format_slot_time(slot["timestamp"], event["tz"])
+    note = (
+        f"Cleared your answer for {when}."
+        if clearing
+        else f"You're down as **{STATUS_EMOJIS[status]}** for {when}."
+    )
+
+    # Editing the message updates the tally and acknowledges the click at once.
+    await interaction.response.edit_message(content=button_message_text(event, slot))
+    await interaction.followup.send(note, ephemeral=True)
+
+    if not clearing and user_id not in _avatar_cache and interaction.guild is not None:
+        run_in_background(fetch_avatars(interaction.guild, [user_id]))
 
 
 @bot.tree.command(name="rsvp", description="Create an RSVP — one message per time slot")
@@ -954,38 +1089,52 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
 
         event_id = str(uuid.uuid4())
         slots = {}
+        mode = guild_mode(interaction.guild_id)
 
         # Register the event up front. Seeding 3 reactions across every slot
         # takes many rate-limited round trips, and until this dict existed any
         # reaction arriving mid-creation raised a KeyError in the handler.
-        active_events[event_id] = {
+        # The mode is recorded here rather than read later, so an RSVP keeps
+        # behaving the way it was built even if the server setting changes.
+        event = {
             "title": title,
             "guild_id": interaction.guild_id,
             "channel_id": interaction.channel_id,
             "tz": tz,
+            "mode": mode,
             "slots": slots,
         }
+        active_events[event_id] = event
         closed = register_event(interaction.guild_id, event_id)
 
         for time_label in time_slots:
-            ts = build_timestamp(time_label, date_str, tz)
+            slot = {
+                "message_id": None,
+                "timestamp": build_timestamp(time_label, date_str, tz),
+                "votes": {emoji: set() for emoji in STATUS_EMOJIS},
+            }
+
             # The server's own clock leads, so everyone reads the same time
             # when comparing slots or quoting one back. The <t:...> timestamp
             # trails it and is rendered by Discord in each reader's timezone,
             # which is the one thing an image summary can never do.
-            message = await interaction.channel.send(
-                f"**{title} — {format_slot_time(ts, tz)} {format_zone_label(ts, tz)}**"
-                f"  ·  your local time: <t:{ts}:t>"
-            )
+            if mode == BUTTON_MODE:
+                message = await interaction.channel.send(
+                    button_message_text(event, slot),
+                    view=RSVPView(event_id, time_label),
+                )
+            else:
+                message = await interaction.channel.send(slot_headline(event, slot))
 
             # Index the slot BEFORE seeding its reactions, so someone clicking
             # the instant the message appears is recorded rather than dropped.
-            slots[time_label] = {
-                "message_id": message.id,
-                "timestamp": ts,
-                "votes": {emoji: set() for emoji in STATUS_EMOJIS},
-            }
+            slot["message_id"] = message.id
+            slots[time_label] = slot
             message_index[message.id] = (event_id, time_label)
+
+            # Buttons arrive live with the message; there's nothing to seed.
+            if mode == BUTTON_MODE:
+                continue
 
             for emoji in STATUS_ORDER:
                 try:
@@ -1028,7 +1177,7 @@ def partial_message(channel_id: int, message_id: int):
 
 
 def locate_slot(message_id: int):
-    """Resolve a message id to its slot, or None if it isn't a live RSVP."""
+    """Resolve a message id to (event, slot), or None if it isn't a live RSVP."""
     lookup = message_index.get(message_id)
     if not lookup:
         return None
@@ -1036,7 +1185,10 @@ def locate_slot(message_id: int):
     event = active_events.get(event_id)
     if event is None:
         return None
-    return event["slots"].get(time_label)
+    slot = event["slots"].get(time_label)
+    if slot is None:
+        return None
+    return event, slot
 
 
 def events_for_guild(guild_id: int) -> list:
@@ -1322,8 +1474,12 @@ async def reconcile_event(event: dict, channel, repair: bool = True) -> None:
 
     Pass repair=False on a read path to skip the rate-limited reaction writes;
     callers that want them can schedule a repair pass afterwards.
+
+    Does nothing for a button RSVP. Its votes live only in memory — there are
+    no reactions to read back, so "reconciling" one would find every option at
+    zero and wipe the tally.
     """
-    if channel is None:
+    if channel is None or event["mode"] == BUTTON_MODE:
         return
 
     await asyncio.gather(
@@ -1340,7 +1496,10 @@ async def repair_event(event: dict, channel) -> None:
     if channel is None:
         return
 
-    keep = keeps_placeholders(event["guild_id"])
+    if event["mode"] == BUTTON_MODE:
+        return  # nothing to repair: a button RSVP carries no reactions
+
+    keep = event["mode"] == KEEP_PLACEHOLDERS
     await asyncio.gather(
         *(repair_slot(channel, slot, keep) for slot in event["slots"].values()),
         return_exceptions=True,
@@ -1355,9 +1514,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if emoji not in STATUS_EMOJIS:
         return
 
-    slot = locate_slot(payload.message_id)
-    if slot is None:
+    found = locate_slot(payload.message_id)
+    if found is None:
         return
+    event, slot = found
+    if event["mode"] == BUTTON_MODE:
+        return  # that RSVP answers through its buttons; reactions aren't votes
     slot["votes"][emoji].add(payload.user_id)
 
     # Warm this person's avatar now, so /summary isn't paying for the download
@@ -1371,7 +1533,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # count. Claim the key before awaiting: several people reacting at once
     # would otherwise each fire their own removal request.
     key = (payload.message_id, emoji)
-    if keeps_placeholders(payload.guild_id) or key not in bot_seeded:
+    if event["mode"] == KEEP_PLACEHOLDERS or key not in bot_seeded:
         return
     bot_seeded.discard(key)
 
@@ -1390,8 +1552,11 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if emoji not in STATUS_EMOJIS:
         return
 
-    slot = locate_slot(payload.message_id)
-    if slot is None:
+    found = locate_slot(payload.message_id)
+    if found is None:
+        return
+    event, slot = found
+    if event["mode"] == BUTTON_MODE:
         return
     slot["votes"][emoji].discard(payload.user_id)
 
@@ -1408,7 +1573,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     await ensure_option_order(
         bot.get_channel(payload.channel_id),
         slot,
-        keeps_placeholders(payload.guild_id),
+        event["mode"] == KEEP_PLACEHOLDERS,
     )
 
 

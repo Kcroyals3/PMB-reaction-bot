@@ -14,7 +14,7 @@ The server's timezone leads, so everyone sees the same time when comparing slots
 title — what people are RSVPing to (e.g. "Movie Night")
 date (optional) — YYYY-MM-DD, defaults to today
 
-Each message gets ✅ (yes), ❌ (no), and ❓ (maybe) reactions. The bot seeds all three so people can click them — see /setreactions for what it does with its own reaction afterwards.
+Each message gets ✅ (yes), ❌ (no), and ❓ (maybe) reactions — or three buttons instead, depending on /setvoting.
 
 Up to 3 RSVPs can run at once per server. Creating a fourth closes the oldest, and you're told which one. Two running at the same time can't share a title, because the title is how /summary and /reactping tell them apart.
 
@@ -40,15 +40,27 @@ Fixed UTC offsets are deliberately not accepted: an offset can't know about dayl
 
 This is a server-wide setting, not per-user — one admin sets it and it applies to everyone in the guild. Requires Manage Server permission.
 
-/setreactions <mode>
+/setvoting <mode>
 
-Chooses what the bot does with its own placeholder reactions. Requires Manage Server permission.
+Chooses how people answer an RSVP. Requires Manage Server permission.
 
-Clear (default) — the bot removes its own reaction the moment a real person picks that option, so the count on the message is exactly the number of people. The cost: when the last vote on an option is withdrawn, that option briefly disappears from the message and has to be re-added, which puts it at the end, so the bot has to re-lay all three to keep them in order.
+Reactions, clear the bot's own (default) — the bot removes its own reaction the moment a real person picks that option, so the count on the message is exactly the number of people. The cost: when the last vote on an option is withdrawn, that option briefly disappears from the message and has to be re-added, which puts it at the end, so the bot has to re-lay all three to keep them in order.
 
-Keep — the bot leaves all three reactions in place permanently. Every count reads one higher than the real number, but the options can never vanish and so can never fall out of ✅ ❌ ❓ order.
+Reactions, keep the bot's own — the bot leaves all three reactions in place permanently. Every count reads one higher than the real number, but the options can never vanish and so can never fall out of ✅ ❌ ❓ order.
 
-Either way the bot is excluded from the tally, so it never appears in the summary image or counts toward /reactping.
+Buttons — no reactions at all. Three buttons sit under each message and the tally is written into the message itself, updated on every press:
+
+**Movie Night — 8:00 PM EDT**  ·  your local time: 5:00 PM
+✅ 4   ❌ 1   ❓ 2
+[ ✅ Yes ] [ ❌ No ] [ ❓ Maybe ]
+
+Counts are exact, the options can't move or disappear, and a press is exclusive — one answer per person per slot, and pressing the one you already chose clears it. (With reactions a person can sit in both Yes and Maybe at once.)
+
+The tradeoff is that button votes live only in memory, so a bot restart loses them. Reactions at least survive on the message and get read back on the next /summary. After a restart, pressing a button on an old RSVP shows Discord's generic "interaction failed" rather than a message.
+
+In every mode the bot is excluded from the tally, so it never appears in the summary image or counts toward /reactping.
+
+The mode is recorded on each RSVP when it's created — a message posted with buttons can't become a reaction message — so changing this affects new RSVPs. Switching between the two reaction modes does apply to RSVPs already running.
 
 /summary [title]
 
@@ -87,5 +99,5 @@ Connect the repo to a Railway service.
 Add DISCORD_TOKEN under the service's Variables tab.
 Railway auto-redeploys on every push to the connected branch.
 Notes
-Settings (/settimes, /settimezone, /setroster, /setreactions) and RSVP data are stored in memory — they reset if the bot restarts.
+Settings (/settimes, /settimezone, /setroster, /setvoting) and RSVP data are stored in memory — they reset if the bot restarts.
 Up to 3 RSVPs are tracked per server at once; creating a fourth closes the oldest and stops tracking reactions on its messages.
