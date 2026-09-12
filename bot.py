@@ -18,7 +18,7 @@ intents.members = True  # needed to iterate role members for /reactping
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DEFAULT_TIME_SLOTS = ["19:00", "19:30", "20:00", "20:30", "21:00", "21:30", "22:00"]
+DEFAULT_TIME_SLOTS = ["20:00", "20:30", "21:00", "21:30", "22:00", "22:30", "23:00"]
 
 STATUS_EMOJIS = {
     "✅": "Yes",
@@ -429,11 +429,19 @@ async def fetch_avatars(guild: discord.Guild, user_ids) -> dict:
     return avatars
 
 
+_mask_cache = {}
+
+
 def _circle_mask(size: int) -> Image.Image:
-    # Built oversized and downsampled so the circle edge is antialiased.
-    mask = Image.new("L", (size * 4, size * 4), 0)
-    ImageDraw.Draw(mask).ellipse([0, 0, size * 4 - 1, size * 4 - 1], fill=255)
-    return mask.resize((size, size), Image.LANCZOS)
+    """Antialiased circular mask. Identical for a given size, so built once."""
+    mask = _mask_cache.get(size)
+    if mask is None:
+        # Built oversized and downsampled so the circle edge is antialiased.
+        mask = Image.new("L", (size * 4, size * 4), 0)
+        ImageDraw.Draw(mask).ellipse([0, 0, size * 4 - 1, size * 4 - 1], fill=255)
+        mask = mask.resize((size, size), Image.LANCZOS)
+        _mask_cache[size] = mask
+    return mask
 
 
 def build_avatar(raw: bytes, name: str, size: int) -> Image.Image:
@@ -612,6 +620,8 @@ def build_summary_image(
     rule_y = header_h - _s(10)
     draw.line([PAD, rule_y, WIDTH - PAD, rule_y], fill=DIVIDER, width=SCALE)
 
+    avatar_images = {}
+
     for card in cards:
         top = card["y"]
         bottom = top + card["height"]
@@ -670,7 +680,12 @@ def build_summary_image(
                 )
 
             for uid, display_name in column["people"]:
-                avatar = build_avatar(avatars.get(uid), display_name, AVATAR)
+                # Someone who answered every slot would otherwise have their
+                # avatar composited once per slot instead of once.
+                avatar = avatar_images.get(uid)
+                if avatar is None:
+                    avatar = build_avatar(avatars.get(uid), display_name, AVATAR)
+                    avatar_images[uid] = avatar
                 img.paste(avatar, (col_x, row_y), avatar)
                 draw.text(
                     (col_x + AVATAR + _s(8), row_y + _s(5)),
@@ -865,8 +880,28 @@ def locate_slot(message_id: int):
     return event["slots"].get(time_label)
 
 
-async def ensure_option_order(message, slot) -> None:
-    """Lay the three options out on `message` in STATUS_ORDER.
+# Re-laying the options is a remove-then-add sequence, and Discord rate limits
+# reaction writes hard. A rate-limited add would otherwise leave that option
+# missing until something else happened to re-add it — and since the options go
+# back in STATUS_ORDER, the casualty was almost always the last one, ❓.
+REACTION_RETRY_DELAY = 1.0
+REACTION_ADD_ATTEMPTS = 3
+
+# message_id -> lock. Two reactions withdrawn at once would otherwise run two
+# re-lays over each other, each acting on a snapshot the other had invalidated.
+_order_locks = {}
+
+
+def order_lock(message_id: int) -> asyncio.Lock:
+    lock = _order_locks.get(message_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _order_locks[message_id] = lock
+    return lock
+
+
+async def ensure_option_order(channel, slot) -> None:
+    """Lay the three options out on the slot's message in STATUS_ORDER.
 
     Discord orders reactions by when each emoji was first added, and an emoji
     whose count falls to zero disappears from the message entirely — so the
@@ -879,43 +914,56 @@ async def ensure_option_order(message, slot) -> None:
     when every option is empty — including a freshly created RSVP — the order
     is exactly STATUS_ORDER; when some already hold votes, those keep their
     places and the placeholders are laid out in order after them.
+
+    The message is fetched inside the lock rather than passed in, so a caller
+    that waited on the lock acts on the current state instead of the snapshot
+    it took before waiting.
     """
-    if bot.user is None:
+    if bot.user is None or channel is None:
         return
 
-    current = [
-        str(reaction.emoji)
-        for reaction in message.reactions
-        if str(reaction.emoji) in STATUS_EMOJIS
-    ]
-    # An option with real votes is anchored; the rest are ours to re-lay.
-    movable = [emoji for emoji in STATUS_ORDER if not slot["votes"].get(emoji)]
-    anchored = [emoji for emoji in current if emoji not in movable]
-
-    if current == anchored + movable:
-        return  # already the best arrangement available
-
-    for emoji in movable:
-        if emoji not in current:
-            continue
+    async with order_lock(slot["message_id"]):
         try:
-            await message.remove_reaction(emoji, bot.user)
-        except discord.HTTPException:
-            pass
-        bot_seeded.discard((message.id, emoji))
+            message = await channel.fetch_message(slot["message_id"])
+        except (discord.HTTPException, discord.NotFound):
+            return
 
-    # After this loop bot_seeded tells the truth for every movable option:
-    # present if the placeholder actually landed, absent if it didn't, so a
-    # failed add is retried on the next removal instead of stranding the
-    # option as permanently unclickable.
-    for emoji in movable:
-        key = (message.id, emoji)
-        try:
-            await message.add_reaction(emoji)
-        except discord.HTTPException:
+        current = [
+            str(reaction.emoji)
+            for reaction in message.reactions
+            if str(reaction.emoji) in STATUS_EMOJIS
+        ]
+        # An option with real votes is anchored; the rest are ours to re-lay.
+        movable = [emoji for emoji in STATUS_ORDER if not slot["votes"].get(emoji)]
+        anchored = [emoji for emoji in current if emoji not in movable]
+
+        if current == anchored + movable:
+            return  # already the best arrangement available
+
+        for emoji in movable:
+            if emoji not in current:
+                continue
+            try:
+                await message.remove_reaction(emoji, bot.user)
+            except discord.HTTPException:
+                pass
+            bot_seeded.discard((message.id, emoji))
+
+        # Every option this drops must come back. Retry rather than leaving a
+        # hole, and only mark it seeded once the placeholder actually landed,
+        # so a genuine failure is retried later instead of looking done.
+        for emoji in movable:
+            key = (message.id, emoji)
             bot_seeded.discard(key)
-            continue
-        bot_seeded.add(key)
+            for attempt in range(REACTION_ADD_ATTEMPTS):
+                try:
+                    await message.add_reaction(emoji)
+                except discord.HTTPException:
+                    if attempt + 1 < REACTION_ADD_ATTEMPTS:
+                        await asyncio.sleep(REACTION_RETRY_DELAY)
+                    continue
+                bot_seeded.add(key)
+                break
 
 
 async def read_reaction_voters(reaction) -> set:
@@ -927,7 +975,27 @@ async def read_reaction_voters(reaction) -> set:
     return voters
 
 
+_background_tasks = set()
+
+
+def _background_done(task) -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        print(f"background task failed: {error!r}", flush=True)
+
+
+def run_in_background(coro) -> None:
+    """Fire and forget, holding a reference so the task isn't GC'd mid-flight."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_done)
+
+
 async def reconcile_slot(channel, slot: dict) -> None:
+    """Read-only: refresh this slot's tally from what Discord actually holds."""
     try:
         message = await channel.fetch_message(slot["message_id"])
     except (discord.HTTPException, discord.NotFound):
@@ -951,21 +1019,37 @@ async def reconcile_slot(channel, slot: dict) -> None:
 
     slot["votes"] = votes
 
-    for emoji in STATUS_ORDER:
-        key = (slot["message_id"], emoji)
-        if votes[emoji] and key in bot_seeded:
-            # Real votes landed here, so the bot's placeholder is no longer
-            # needed and would otherwise inflate the count.
-            bot_seeded.discard(key)
-            try:
-                await message.remove_reaction(emoji, bot.user)
-            except discord.HTTPException:
-                pass
 
-    await ensure_option_order(message, slot)
+async def repair_slot(channel, slot: dict) -> None:
+    """Write path: drop spent placeholders and restore the option order.
+
+    Kept separate from the read above because these are reaction writes, and
+    Discord rate limits those hard — roughly a quarter second apiece. Running
+    them before /summary could send its image added seconds of delay for
+    something the reader never sees.
+    """
+    message = (
+        channel.get_partial_message(slot["message_id"])
+        if hasattr(channel, "get_partial_message")
+        else None
+    )
+
+    if message is not None:
+        for emoji in STATUS_ORDER:
+            key = (slot["message_id"], emoji)
+            if slot["votes"].get(emoji) and key in bot_seeded:
+                # Real votes landed here, so the bot's placeholder is no longer
+                # needed and would otherwise inflate the count.
+                bot_seeded.discard(key)
+                try:
+                    await message.remove_reaction(emoji, bot.user)
+                except discord.HTTPException:
+                    pass
+
+    await ensure_option_order(channel, slot)
 
 
-async def reconcile_event(event: dict, channel) -> None:
+async def reconcile_event(event: dict, channel, repair: bool = True) -> None:
     """Re-read the real reaction state from Discord into the event.
 
     Reaction events can be missed — while the bot is busy seeding a new RSVP,
@@ -973,15 +1057,31 @@ async def reconcile_event(event: dict, channel) -> None:
     to what Discord actually holds, so a missed click is recovered rather than
     lost until someone re-reacts.
 
-    Slots are reconciled concurrently. Done one at a time, a seven-slot RSVP
-    meant roughly thirty sequential round trips before /summary could even
-    start rendering.
+    Slots are handled concurrently. Done one at a time, a seven-slot RSVP meant
+    roughly thirty sequential round trips before /summary could start rendering.
+
+    Pass repair=False on a read path to skip the rate-limited reaction writes;
+    callers that want them can schedule a repair pass afterwards.
     """
     if channel is None:
         return
 
     await asyncio.gather(
         *(reconcile_slot(channel, slot) for slot in event["slots"].values()),
+        return_exceptions=True,
+    )
+
+    if repair:
+        await repair_event(event, channel)
+
+
+async def repair_event(event: dict, channel) -> None:
+    """Run the reaction-write half of reconcile across every slot."""
+    if channel is None:
+        return
+
+    await asyncio.gather(
+        *(repair_slot(channel, slot) for slot in event["slots"].values()),
         return_exceptions=True,
     )
 
@@ -998,6 +1098,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if slot is None:
         return
     slot["votes"][emoji].add(payload.user_id)
+
+    # Warm this person's avatar now, so /summary isn't paying for the download
+    # later while someone waits on the image.
+    if payload.user_id not in _avatar_cache and payload.guild_id is not None:
+        guild = bot.get_guild(payload.guild_id)
+        if guild is not None:
+            run_in_background(fetch_avatars(guild, [payload.user_id]))
 
     # A real person reacted, so drop the bot's seed to stop it inflating the
     # count. Claim the key before awaiting: several people reacting at once
@@ -1033,22 +1140,11 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     key = (payload.message_id, emoji)
     if slot["votes"][emoji] or key in bot_seeded:
         return
-    bot_seeded.add(key)  # claim, so two removals don't both re-lay the options
-
-    # A re-added emoji lands at the end of the message, so this re-lays the
-    # placeholders rather than just adding one back — otherwise the options
-    # drift out of ✅ ❌ ❓ order the first time a vote is fully withdrawn.
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        bot_seeded.discard(key)
-        return
-    try:
-        message = await channel.fetch_message(payload.message_id)
-    except (discord.HTTPException, discord.NotFound):
-        bot_seeded.discard(key)
-        return
-
-    await ensure_option_order(message, slot)
+    # That was the last real vote, so the option has just vanished from the
+    # message. Re-lay the placeholders rather than adding the one back: a
+    # re-added emoji lands at the end, which is what knocked ✅ ❌ ❓ out of
+    # order. ensure_option_order owns bot_seeded for the options it touches.
+    await ensure_option_order(bot.get_channel(payload.channel_id), slot)
 
 
 @bot.tree.command(name="reactping", description="Ping roster members missing a reaction on any time slot")
@@ -1080,8 +1176,10 @@ async def reactping(interaction: discord.Interaction):
 
     # Resync before naming names — pinging someone who did respond, because
     # their reaction was missed, is worse than the command being a bit slow.
+    # Reaction repairs can wait until after the ping has gone out.
     await interaction.response.defer()
-    await reconcile_event(event, bot.get_channel(event["channel_id"]))
+    channel = bot.get_channel(event["channel_id"])
+    await reconcile_event(event, channel, repair=False)
 
     # A member "reacted" to a time slot if they used ANY of the 3 status
     # emojis on that slot's message. They need to have reacted to EVERY slot.
@@ -1126,10 +1224,12 @@ async def summary(interaction: discord.Interaction):
     await interaction.response.defer()
 
     event = active_events[event_id]
+    channel = bot.get_channel(event["channel_id"])
 
-    # Pull the true reaction state first, so the image reflects Discord rather
-    # than whatever the in-memory tally happens to hold.
-    await reconcile_event(event, bot.get_channel(event["channel_id"]))
+    # Read the true state so the image reflects Discord, but skip the reaction
+    # writes: they're rate limited and would sit in front of the image for no
+    # benefit the reader can see. They run in the background once it's sent.
+    await reconcile_event(event, channel, repair=False)
 
     voter_ids = {
         uid
@@ -1147,6 +1247,9 @@ async def summary(interaction: discord.Interaction):
 
     file = discord.File(buffer, filename="rsvp_summary.png")
     await interaction.followup.send(file=file)
+
+    # Tidy the reactions after the image has landed rather than before it.
+    run_in_background(repair_event(event, channel))
 
 
 if __name__ == "__main__":
