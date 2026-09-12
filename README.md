@@ -20,13 +20,19 @@ Customize the time slots used by /rsvp. Comma-separated, 24-hour format:
 
 Replaces the default slots (8:00, 8:30, 9:00, 9:30, 10:00, 10:30, 11:00) for this server. Requires Manage Server permission.
 
-/settimezone <offset>
+/settimezone <zone>
 
-Sets the UTC offset used to interpret the times given in /settimes and /rsvp. Run once per server so the bot knows what timezone your times are written in:
+Sets the timezone used to interpret the times given in /settimes and /rsvp. Defaults to America/New_York (US Eastern), so most servers never need to run this.
 
-/settimezone offset:-4
+/settimezone zone:America/New_York
 
-(-4 = EDT, -5 = EST, 5.5 = IST, etc.) Requires Manage Server permission.
+Prefer an IANA zone name — it handles the EST/EDT changeover automatically, so 8:00 PM stays 8:00 PM year-round. A fixed UTC offset (/settimezone zone:-5) is also accepted, but will be an hour off for part of the year. Requires Manage Server permission.
+
+/summary
+
+Renders a shareable PNG of every time slot with each responder's avatar and name, grouped into Yes / No / Maybe, and badges the slot with the most yes votes.
+
+Because it's an image rather than Discord markdown, it cannot localize per viewer the way /rsvp messages do — so it states its timezone in the header ("all times EDT"). Everyone sees the server's timezone.
 
 /setroster <role>
 
@@ -38,7 +44,9 @@ Pings everyone in the roster who hasn't reacted to every time slot of the most r
 
 Setup
 Install dependencies:
-   pip install discord.py
+   pip install -r requirements.txt
+
+Summary images need a real font installed. The Docker image handles this (fonts-dejavu-core and fonts-noto-color-emoji); on a bare host, install DejaVu or set SUMMARY_FONT / SUMMARY_FONT_BOLD to a .ttf path. Without one, Pillow falls back to a tiny bitmap face and non-ASCII text renders as boxes — the bot prints a warning if this happens.
 Set the DISCORD_TOKEN environment variable with your bot's token (never hardcode it in the file).
 Run:
    python bot.py
