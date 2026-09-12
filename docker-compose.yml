@@ -1,0 +1,9 @@
+version: "3.8"
+
+services:
+  mbl-reaction-bot:
+    build: .
+    container_name: mbl-reaction-bot
+    restart: always
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
