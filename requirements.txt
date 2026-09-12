@@ -1,2 +1,5 @@
 discord.py
 Pillow
+# Ships the IANA timezone database so zoneinfo works regardless of what the
+# base image or host OS provides.
+tzdata
