@@ -2,6 +2,7 @@ import asyncio
 import os
 import io
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -769,8 +770,13 @@ def build_summary_image(
 
     img = img.resize((WIDTH // SCALE, height // SCALE), Image.LANCZOS)
 
+    # The palette here is a handful of flat UI colors plus small avatar photos,
+    # so 256 colors is visually indistinguishable and cuts the file to roughly
+    # a quarter — a quarter of the bytes Discord has to accept on upload.
+    img = img.quantize(colors=256, method=Image.FASTOCTREE, dither=Image.Dither.NONE)
+
     buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
+    img.save(buffer, format="PNG", optimize=True)
     buffer.seek(0)
     return buffer
 
@@ -1407,27 +1413,58 @@ def run_in_background(coro) -> None:
 
 
 async def reconcile_slot(channel, slot: dict) -> None:
-    """Read-only: refresh this slot's tally from what Discord actually holds."""
+    """Read-only: refresh this slot's tally from what Discord actually holds.
+
+    Paging a reaction's users is among the most aggressively rate limited calls
+    in the API, and a seven-slot RSVP needed 21 of them — which discord.py
+    serializes, and which is where a 23-second /summary was going.
+
+    message.reactions already carries a count, and it comes free with the fetch.
+    So compare that against what we hold and page only the ones that disagree,
+    which is normally none of them.
+    """
     try:
         message = await channel.fetch_message(slot["message_id"])
     except (discord.HTTPException, discord.NotFound):
         return
 
-    relevant = [r for r in message.reactions if str(r.emoji) in STATUS_EMOJIS]
-    pages = await asyncio.gather(
-        *(read_reaction_voters(reaction) for reaction in relevant),
-        return_exceptions=True,
-    )
+    by_emoji = {
+        str(reaction.emoji): reaction
+        for reaction in message.reactions
+        if str(reaction.emoji) in STATUS_EMOJIS
+    }
 
-    votes = {emoji: set() for emoji in STATUS_EMOJIS}
-    for reaction, result in zip(relevant, pages):
-        emoji = str(reaction.emoji)
-        if isinstance(result, BaseException):
+    votes = {}
+    disputed = []
+    for emoji in STATUS_ORDER:
+        known = set(slot["votes"].get(emoji, ()))
+        reaction = by_emoji.get(emoji)
+
+        if reaction is None:
+            # The option isn't on the message at all, so nobody holds it.
+            votes[emoji] = set()
+            continue
+
+        # The bot's own placeholder is in Discord's count but not in ours.
+        seeded = 1 if (slot["message_id"], emoji) in bot_seeded else 0
+        if reaction.count == len(known) + seeded:
+            votes[emoji] = known
+        else:
+            disputed.append(emoji)
+
+    if disputed:
+        pages = await asyncio.gather(
+            *(read_reaction_voters(by_emoji[emoji]) for emoji in disputed),
+            return_exceptions=True,
+        )
+        for emoji, result in zip(disputed, pages):
             # Couldn't page this one — keep the tally we already had rather
             # than silently zeroing real votes.
-            votes[emoji] = set(slot["votes"].get(emoji, ()))
-        else:
-            votes[emoji] = result
+            votes[emoji] = (
+                set(slot["votes"].get(emoji, ()))
+                if isinstance(result, BaseException)
+                else result
+            )
 
     slot["votes"] = votes
 
@@ -1652,28 +1689,54 @@ async def summary(interaction: discord.Interaction, title: str = None):
     await interaction.response.defer()
 
     channel = bot.get_channel(event["channel_id"])
+    started = time.perf_counter()
+
+    def since_start():
+        return (time.perf_counter() - started) * 1000
+
+    def current_voters():
+        return {
+            uid
+            for slot in event["slots"].values()
+            for voters in slot["votes"].values()
+            for uid in voters
+        }
 
     # Read the true state so the image reflects Discord, but skip the reaction
     # writes: they're rate limited and would sit in front of the image for no
     # benefit the reader can see. They run in the background once it's sent.
-    await reconcile_event(event, channel, repair=False)
+    #
+    # Warm avatars for everyone already known while that read is in flight —
+    # both are network-bound and neither depends on the other.
+    await asyncio.gather(
+        reconcile_event(event, channel, repair=False),
+        fetch_avatars(interaction.guild, current_voters()),
+    )
+    read_ms = since_start()
 
-    voter_ids = {
-        uid
-        for slot in event["slots"].values()
-        for voters in slot["votes"].values()
-        for uid in voters
-    }
-    avatars = await fetch_avatars(interaction.guild, voter_ids)
+    # Anyone the read turned up who wasn't known before; the rest are cached.
+    avatars = await fetch_avatars(interaction.guild, current_voters())
+    avatar_ms = since_start() - read_ms
 
     # Compositing a few dozen avatars is CPU-bound; keep it off the event loop
     # so the bot stays responsive while the image is built.
     buffer = await asyncio.to_thread(
         build_summary_image, event, interaction.guild, avatars
     )
+    render_ms = since_start() - read_ms - avatar_ms
 
     file = discord.File(buffer, filename="rsvp_summary.png")
     await interaction.followup.send(file=file)
+
+    # Logged per stage so a slow /summary can be diagnosed from the container
+    # logs rather than guessed at.
+    print(
+        f"/summary {event['title']!r}: read {read_ms:.0f}ms, "
+        f"avatars {avatar_ms:.0f}ms, render {render_ms:.0f}ms, "
+        f"upload {since_start() - read_ms - avatar_ms - render_ms:.0f}ms, "
+        f"total {since_start():.0f}ms",
+        flush=True,
+    )
 
     # Tidy the reactions after the image has landed rather than before it.
     run_in_background(repair_event(event, channel))
