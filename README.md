@@ -70,6 +70,20 @@ title picks which RSVP when more than one is running — it autocompletes, and m
 
 Because it's an image rather than Discord markdown, it cannot localize per viewer the way /rsvp messages do — so it states its timezone in the header ("all times EDT"). Everyone sees the server's timezone.
 
+/rsvps
+
+Lists what's running on this server: each title, its date, how many slots and how many people have answered, which voting mode it uses, whether it has a live summary pinned, and the best turnout so far. Use a title from here with /summary or /reactping.
+
+/setlivesummary <enabled>
+
+Pins a summary image that redraws itself as people answer, so nobody has to run /summary to see where things stand. Requires Manage Server permission.
+
+It uses the compact grid layout (people down the side, slots across the top) rather than the detailed card layout, because a live image lives in the channel permanently — the grid says the same thing in about a quarter of the height.
+
+It redraws at most once every 4 seconds. Replacing a message's image means re-uploading it, so a burst of twenty answers becomes one redraw rather than twenty. Pinning needs Manage Messages; without it the summary still works, just unpinned.
+
+Turning it off leaves the image in place, marks it as no longer updating, and unpins it.
+
 /setroster <role>
 
 Sets which role counts as "the roster" for /reactping. Requires Manage Server permission.
@@ -98,6 +112,14 @@ Push bot.py, requirements.txt, and a Procfile (worker: python bot.py) to a GitHu
 Connect the repo to a Railway service.
 Add DISCORD_TOKEN under the service's Variables tab.
 Railway auto-redeploys on every push to the connected branch.
+Persistence
+
+Settings and running RSVPs are saved to a JSON file and reloaded on startup, so a restart or redeploy doesn't lose them. Set STATE_FILE to choose the path; it defaults to state.json next to bot.py.
+
+In Docker this needs a volume, or the file lives inside the container and disappears when it's recreated. docker-compose.yml already mounts one at /data and points STATE_FILE there.
+
+Writes are atomic (written to a temp file, then renamed) so a crash mid-write can't leave a truncated file, and they're batched — a burst of answers is one write, not twenty. A state file that's corrupt or written by a different version is reported and ignored rather than crashing the bot.
+
 Notes
-Settings (/settimes, /settimezone, /setroster, /setvoting) and RSVP data are stored in memory — they reset if the bot restarts.
 Up to 3 RSVPs are tracked per server at once; creating a fourth closes the oldest and stops tracking reactions on its messages.
+Button RSVPs have their views re-registered on startup, so their buttons keep working across a restart.

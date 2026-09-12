@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import io
 import re
@@ -96,8 +97,16 @@ RSVP_MODES = (CLEAR_PLACEHOLDERS, KEEP_PLACEHOLDERS, BUTTON_MODE)
 guild_seed_mode = {}
 
 
+# guild_id -> bool. Whether a new RSVP gets a pinned, self-updating summary.
+guild_live_summary = {}
+
+
 def guild_mode(guild_id) -> str:
     return guild_seed_mode.get(guild_id, CLEAR_PLACEHOLDERS)
+
+
+def wants_live_summary(guild_id) -> bool:
+    return bool(guild_live_summary.get(guild_id, False))
 
 # guild_id -> tzinfo. Named IANA zones rather than fixed offsets, so a server
 # set to Eastern stays correct across the EST/EDT changeover instead of
@@ -537,6 +546,17 @@ def build_avatar(raw: bytes, name: str, size: int) -> Image.Image:
     return avatar
 
 
+# A letter goes in every grid cell, not just a colour. Checked rather than
+# assumed: the worst adjacent pair here is ❌ vs ✅ at ΔE 7.7 under deuteranopia,
+# which is inside the band where colour alone is not enough. Normal-vision
+# separation (21.1) and contrast against the card both pass, so the Discord
+# colours themselves stay — they just never carry meaning on their own.
+STATUS_MARKS = {
+    "✅": "Y",
+    "❌": "N",
+    "❓": "?",
+}
+
 # Rendered at 2x and downsampled at the end, which keeps text crisp on the
 # high-DPI displays Discord is usually viewed on.
 SCALE = 2
@@ -557,6 +577,213 @@ MAX_NAMES_PER_COLUMN = 12
 
 def _s(value: int) -> int:
     return int(value) * SCALE
+
+
+CELL_INK = (16, 20, 18)
+CELL_EMPTY = (52, 55, 60)
+GRID_MAX_ROWS = 25
+
+
+def build_grid_image(
+    event: dict, guild: discord.Guild, avatars: dict = None
+) -> io.BytesIO:
+    """A compact who-by-when matrix: people down the side, slots across the top.
+
+    The detailed card layout runs to ~2000px for a full roster, which is a wall
+    when it lives permanently in a channel. This says the same thing in about a
+    quarter of the height, at the cost of names appearing once instead of once
+    per slot.
+    """
+    avatars = avatars or {}
+    title_font = load_font(_s(26), bold=True)
+    subtitle_font = load_font(_s(13))
+    column_font = load_font(_s(12), bold=True)
+    name_font = load_font(_s(13))
+    mark_font = load_font(_s(13), bold=True)
+    total_font = load_font(_s(12), bold=True)
+    legend_font = load_font(_s(12))
+
+    PAD = _s(28)
+    NAME_W = _s(206)
+    PITCH = _s(84)
+    CELL_W = _s(74)
+    CELL_H = _s(22)
+    ROW_H = _s(30)
+    AVATAR = _s(20)
+    RADIUS = _s(6)
+
+    slots = list(event["slots"].values())
+    WIDTH = PAD * 2 + NAME_W + PITCH * len(slots)
+
+    # --- Measure ------------------------------------------------------------
+    names = {}
+    for slot in slots:
+        for emoji in STATUS_ORDER:
+            for uid in slot["votes"][emoji]:
+                if uid not in names:
+                    member = guild.get_member(uid)
+                    names[uid] = member.display_name if member else f"User {uid}"
+
+    people = sorted(names.items(), key=lambda item: item[1].casefold())
+    hidden = max(0, len(people) - GRID_MAX_ROWS)
+    people = people[:GRID_MAX_ROWS]
+
+    def status_of(slot, uid):
+        for emoji in STATUS_ORDER:
+            if uid in slot["votes"][emoji]:
+                return emoji
+        return None
+
+    header_h = PAD + _s(32) + _s(6) + _s(17) + _s(18)
+    columns_h = _s(24)
+    rows_h = len(people) * ROW_H
+    hidden_h = _s(20) if hidden else 0
+    totals_h = _s(34)
+    legend_h = _s(28)
+    height = header_h + columns_h + rows_h + hidden_h + totals_h + legend_h + PAD
+
+    # --- Draw ---------------------------------------------------------------
+    img = Image.new("RGB", (WIDTH, height), PAGE_BG)
+    draw = ImageDraw.Draw(img)
+
+    draw_rich_text(img, draw, (PAD, PAD), event["title"], title_font, TEXT, _s(26))
+
+    first_ts = slots[0]["timestamp"]
+    person_word = "person" if len(names) == 1 else "people"
+    draw.text(
+        (PAD, PAD + _s(32) + _s(6)),
+        f"{format_slot_date(first_ts, event['tz'])}"
+        f"  ·  all times {format_zone_label(first_ts, event['tz'])}"
+        f"  ·  {len(names)} {person_word} responded",
+        font=subtitle_font,
+        fill=TEXT_MUTED,
+    )
+
+    def column_x(index):
+        return PAD + NAME_W + index * PITCH
+
+    # Column headers
+    for index, slot in enumerate(slots):
+        draw.text(
+            (column_x(index), header_h),
+            format_slot_time(slot["timestamp"], event["tz"]),
+            font=column_font,
+            fill=TEXT_MUTED,
+        )
+
+    rule_y = header_h + columns_h - _s(6)
+    draw.line([PAD, rule_y, WIDTH - PAD, rule_y], fill=DIVIDER, width=SCALE)
+
+    # One row per person
+    avatar_images = {}
+    row_y = header_h + columns_h
+    for uid, display_name in people:
+        avatar = avatar_images.get(uid)
+        if avatar is None:
+            avatar = build_avatar(avatars.get(uid), display_name, AVATAR)
+            avatar_images[uid] = avatar
+        img.paste(avatar, (PAD, row_y + _s(3)), avatar)
+
+        draw.text(
+            (PAD + AVATAR + _s(8), row_y + _s(6)),
+            truncate_to_width(display_name, name_font, NAME_W - AVATAR - _s(16)),
+            font=name_font,
+            fill=TEXT,
+        )
+
+        for index, slot in enumerate(slots):
+            status = status_of(slot, uid)
+            x = column_x(index)
+            box = [x, row_y + _s(4), x + CELL_W, row_y + _s(4) + CELL_H]
+
+            if status is None:
+                # Didn't answer this slot. Deliberately flat and unlabelled so
+                # it reads as absence rather than as a fourth answer.
+                draw.rounded_rectangle(box, radius=RADIUS, fill=CELL_EMPTY)
+                continue
+
+            draw.rounded_rectangle(box, radius=RADIUS, fill=STATUS_COLORS[status])
+            mark = STATUS_MARKS[status]
+            mark_w = draw.textlength(mark, font=mark_font)
+            draw.text(
+                (x + (CELL_W - mark_w) / 2, row_y + _s(7)),
+                mark,
+                font=mark_font,
+                fill=CELL_INK,
+            )
+
+        row_y += ROW_H
+
+    if hidden:
+        draw.text(
+            (PAD, row_y + _s(2)),
+            f"+{hidden} more",
+            font=legend_font,
+            fill=TEXT_FAINT,
+        )
+        row_y += hidden_h
+
+    # Yes-count per slot, with the best turnout called out
+    totals = [len(slot["votes"]["✅"]) for slot in slots]
+    best = max(totals, default=0)
+
+    draw.line([PAD, row_y + _s(4), WIDTH - PAD, row_y + _s(4)], fill=DIVIDER, width=SCALE)
+    draw.text(
+        (PAD + AVATAR + _s(8), row_y + _s(14)),
+        "YES",
+        font=total_font,
+        fill=STATUS_COLORS["✅"],
+    )
+    for index, count in enumerate(totals):
+        winning = best > 0 and count == best
+        label = str(count)
+        label_w = draw.textlength(label, font=total_font)
+        x = column_x(index) + (CELL_W - label_w) / 2
+        draw.text(
+            (x, row_y + _s(14)),
+            label,
+            font=total_font,
+            fill=STATUS_COLORS["✅"] if winning else TEXT_MUTED,
+        )
+        if winning:
+            draw.line(
+                [column_x(index), row_y + _s(10), column_x(index) + CELL_W, row_y + _s(10)],
+                fill=STATUS_COLORS["✅"],
+                width=_s(2),
+            )
+
+    # Legend — the letters are what carry the meaning, the colour reinforces it
+    legend_y = row_y + totals_h
+    x = PAD
+    for emoji in STATUS_ORDER:
+        draw.rounded_rectangle(
+            [x, legend_y, x + _s(18), legend_y + _s(14)],
+            radius=_s(4),
+            fill=STATUS_COLORS[emoji],
+        )
+        mark = STATUS_MARKS[emoji]
+        draw.text(
+            (x + (_s(18) - draw.textlength(mark, font=legend_font)) / 2, legend_y + _s(1)),
+            mark,
+            font=legend_font,
+            fill=CELL_INK,
+        )
+        label = STATUS_EMOJIS[emoji]
+        draw.text((x + _s(24), legend_y + _s(1)), label, font=legend_font, fill=TEXT_MUTED)
+        x += _s(24) + draw.textlength(label, font=legend_font) + _s(18)
+
+    draw.rounded_rectangle(
+        [x, legend_y, x + _s(18), legend_y + _s(14)], radius=_s(4), fill=CELL_EMPTY
+    )
+    draw.text((x + _s(24), legend_y + _s(1)), "No response", font=legend_font, fill=TEXT_MUTED)
+
+    img = img.resize((WIDTH // SCALE, height // SCALE), Image.LANCZOS)
+    img = img.quantize(colors=256, method=Image.FASTOCTREE, dither=Image.Dither.NONE)
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
+    return buffer
 
 
 def build_summary_image(
@@ -781,8 +1008,202 @@ def build_summary_image(
     return buffer
 
 
+# ---------------------------------------------------------------------------
+# Persistence
+#
+# Everything above lives in dictionaries, so a redeploy used to lose every
+# setting and every running RSVP. That was merely annoying until the live
+# summary arrived — a pinned image that stops updating looks current and isn't,
+# which is worse than not being there.
+# ---------------------------------------------------------------------------
+
+STATE_VERSION = 1
+STATE_SAVE_DELAY = 2.0
+_state_save_task = None
+_state_loaded = False
+
+
+def state_path() -> str:
+    return os.environ.get(
+        "STATE_FILE",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"),
+    )
+
+
+def serialize_state() -> dict:
+    return {
+        "version": STATE_VERSION,
+        "guild_times": {str(k): v for k, v in guild_times.items()},
+        "guild_timezones": {
+            str(k): describe_timezone(v) for k, v in guild_timezones.items()
+        },
+        "guild_seed_mode": {str(k): v for k, v in guild_seed_mode.items()},
+        "guild_live_summary": {str(k): bool(v) for k, v in guild_live_summary.items()},
+        "rosters": {str(k): v for k, v in rosters.items()},
+        "guild_events": {str(k): list(v) for k, v in guild_events.items()},
+        "bot_seeded": [[message_id, emoji] for message_id, emoji in bot_seeded],
+        "events": {
+            event_id: {
+                "title": event["title"],
+                "guild_id": event["guild_id"],
+                "channel_id": event["channel_id"],
+                "tz": describe_timezone(event["tz"]),
+                "mode": event["mode"],
+                "live_message_id": event.get("live_message_id"),
+                "live_channel_id": event.get("live_channel_id"),
+                "slots": {
+                    label: {
+                        "message_id": slot["message_id"],
+                        "timestamp": slot["timestamp"],
+                        "votes": {
+                            emoji: sorted(slot["votes"][emoji])
+                            for emoji in STATUS_ORDER
+                        },
+                    }
+                    for label, slot in event["slots"].items()
+                },
+            }
+            for event_id, event in active_events.items()
+        },
+    }
+
+
+def save_state() -> None:
+    path = state_path()
+    try:
+        temporary = f"{path}.tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(serialize_state(), handle)
+        # Swap it in atomically, so a crash mid-write can't leave a truncated
+        # file that then fails to load on the way back up.
+        os.replace(temporary, path)
+    except OSError as error:
+        print(f"WARNING: couldn't save state to {path}: {error}", flush=True)
+
+
+def save_state_soon() -> None:
+    """Coalesce writes — a burst of answers shouldn't be a burst of disk I/O."""
+    global _state_save_task
+
+    if _state_save_task is not None and not _state_save_task.done():
+        return
+
+    async def save_after_delay():
+        await asyncio.sleep(STATE_SAVE_DELAY)
+        await asyncio.to_thread(save_state)
+
+    try:
+        _state_save_task = asyncio.create_task(save_after_delay())
+        _state_save_task.add_done_callback(_background_done)
+    except RuntimeError:
+        save_state()  # no event loop running — just write it
+
+
+def load_state() -> None:
+    path = state_path()
+    if not os.path.exists(path):
+        return
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError) as error:
+        print(
+            f"WARNING: couldn't read saved state from {path} ({error}); "
+            "starting empty.",
+            flush=True,
+        )
+        return
+
+    if data.get("version") != STATE_VERSION:
+        print(
+            f"NOTE: {path} was written by a different version of this bot; "
+            "ignoring it rather than guessing at the format.",
+            flush=True,
+        )
+        return
+
+    guild_times.update({int(k): v for k, v in data.get("guild_times", {}).items()})
+    rosters.update({int(k): v for k, v in data.get("rosters", {}).items()})
+    guild_live_summary.update(
+        {int(k): bool(v) for k, v in data.get("guild_live_summary", {}).items()}
+    )
+    guild_seed_mode.update(
+        {
+            int(k): v
+            for k, v in data.get("guild_seed_mode", {}).items()
+            if v in RSVP_MODES
+        }
+    )
+
+    for key, name in data.get("guild_timezones", {}).items():
+        zone = resolve_timezone(name)
+        if zone is not None:
+            guild_timezones[int(key)] = zone
+
+    for event_id, raw in data.get("events", {}).items():
+        slots = {}
+        for label, saved in raw.get("slots", {}).items():
+            slots[label] = {
+                "message_id": saved["message_id"],
+                "timestamp": saved["timestamp"],
+                "votes": {
+                    emoji: set(saved.get("votes", {}).get(emoji, []))
+                    for emoji in STATUS_ORDER
+                },
+            }
+            message_index[saved["message_id"]] = (event_id, label)
+
+        active_events[event_id] = {
+            "id": event_id,
+            "title": raw["title"],
+            "guild_id": raw["guild_id"],
+            "channel_id": raw["channel_id"],
+            # A zone that no longer resolves (a renamed IANA entry, or a fixed
+            # offset from before those were dropped) falls back rather than
+            # taking the whole RSVP down with it.
+            "tz": resolve_timezone(raw.get("tz", "")) or DEFAULT_TZ,
+            "mode": raw.get("mode", CLEAR_PLACEHOLDERS),
+            "live_message_id": raw.get("live_message_id"),
+            "live_channel_id": raw.get("live_channel_id"),
+            "slots": slots,
+        }
+
+    for key, event_ids in data.get("guild_events", {}).items():
+        guild_events[int(key)] = [
+            event_id for event_id in event_ids if event_id in active_events
+        ]
+
+    for entry in data.get("bot_seeded", []):
+        if isinstance(entry, list) and len(entry) == 2:
+            bot_seeded.add((entry[0], entry[1]))
+
+    if active_events:
+        print(
+            f"Restored {len(active_events)} RSVP(s) from {path}",
+            flush=True,
+        )
+
+
 @bot.event
 async def on_ready():
+    global _state_loaded
+
+    # on_ready fires again on every reconnect; only read the file once.
+    if not _state_loaded:
+        _state_loaded = True
+        load_state()
+
+        # Buttons stop responding across a restart unless their view is
+        # re-registered against the message it was posted on.
+        for event_id, event in active_events.items():
+            if event["mode"] != BUTTON_MODE:
+                continue
+            for label, slot in event["slots"].items():
+                bot.add_view(
+                    RSVPView(event_id, label), message_id=slot["message_id"]
+                )
+
     await bot.tree.sync()
     # State the resolved timezone at startup, so "is it on Eastern?" is
     # answerable from the logs instead of by posting an RSVP to find out.
@@ -801,6 +1222,7 @@ async def on_ready():
 @app_commands.checks.has_permissions(manage_guild=True)
 async def setroster(interaction: discord.Interaction, role: discord.Role):
     rosters[interaction.guild_id] = role.id
+    save_state_soon()
     await interaction.response.send_message(
         f"Roster set to {role.mention}. `/reactping` will check its members.",
         ephemeral=True,
@@ -836,6 +1258,7 @@ async def settimes(interaction: discord.Interaction, times: str):
             slots.append(label)
 
     guild_times[interaction.guild_id] = slots
+    save_state_soon()
 
     readable = ", ".join(format_label(label) for label in slots)
     dropped = len(entries) - len(slots)
@@ -863,6 +1286,7 @@ async def settimezone(interaction: discord.Interaction, zone: str):
         return
 
     guild_timezones[interaction.guild_id] = resolved
+    save_state_soon()
     now = int(datetime.now(timezone.utc).timestamp())
     await interaction.response.send_message(
         f"Timezone set to **{describe_timezone(resolved)}** "
@@ -871,6 +1295,12 @@ async def settimezone(interaction: discord.Interaction, zone: str):
         ephemeral=True,
     )
 
+
+MODE_LABELS = {
+    CLEAR_PLACEHOLDERS: "Reactions",
+    KEEP_PLACEHOLDERS: "Reactions, placeholders kept",
+    BUTTON_MODE: "Buttons",
+}
 
 MODE_EXPLANATIONS = {
     CLEAR_PLACEHOLDERS: (
@@ -933,6 +1363,7 @@ async def setvoting(interaction: discord.Interaction, mode: str):
         return
 
     guild_seed_mode[interaction.guild_id] = value
+    save_state_soon()
 
     # Each RSVP keeps the mode it was created with — a message posted with
     # buttons can't become a reaction message, or the other way round.
@@ -959,6 +1390,121 @@ async def setvoting(interaction: discord.Interaction, mode: str):
             run_in_background(
                 repair_event(event, bot.get_channel(event["channel_id"]))
             )
+
+
+# ---------------------------------------------------------------------------
+# Live summary
+#
+# A pinned image that redraws itself as people answer. Editing a message's text
+# is cheap; replacing its attachment is a fresh upload every time, so this is
+# throttled rather than run per reaction — a burst of twenty clicks produces one
+# redraw, and the redraw reflects all twenty.
+# ---------------------------------------------------------------------------
+
+LIVE_REFRESH_DELAY = 4.0
+
+# event_id -> pending refresh task
+_live_refresh = {}
+
+
+def schedule_live_refresh(event_id: str) -> None:
+    """Queue a redraw, unless one is already queued.
+
+    Deliberately not cancel-and-reschedule: under a steady stream of answers
+    that would keep pushing the redraw into the future and never draw anything.
+    Letting the pending one stand means at most one redraw per window, and it
+    always renders the state as of when it fires.
+    """
+    event = active_events.get(event_id)
+    if event is None or not event.get("live_message_id"):
+        return
+
+    pending = _live_refresh.get(event_id)
+    if pending is not None and not pending.done():
+        return
+
+    async def refresh_after_delay():
+        await asyncio.sleep(LIVE_REFRESH_DELAY)
+        await refresh_live_summary(event_id)
+
+    _live_refresh[event_id] = asyncio.create_task(refresh_after_delay())
+    _live_refresh[event_id].add_done_callback(_background_done)
+
+
+async def render_live_image(event: dict, guild):
+    voter_ids = {
+        uid
+        for slot in event["slots"].values()
+        for voters in slot["votes"].values()
+        for uid in voters
+    }
+    avatars = await fetch_avatars(guild, voter_ids)
+    return await asyncio.to_thread(build_grid_image, event, guild, avatars)
+
+
+async def refresh_live_summary(event_id: str) -> None:
+    event = active_events.get(event_id)
+    if event is None or not event.get("live_message_id"):
+        return
+
+    guild = bot.get_guild(event["guild_id"])
+    channel = bot.get_channel(event.get("live_channel_id") or event["channel_id"])
+    if guild is None or channel is None:
+        return
+
+    buffer = await render_live_image(event, guild)
+    try:
+        message = channel.get_partial_message(event["live_message_id"])
+        await message.edit(
+            attachments=[discord.File(buffer, filename="rsvp_live.png")]
+        )
+    except (discord.HTTPException, discord.NotFound):
+        # Someone deleted it, or we lost access. Stop trying to update it.
+        event["live_message_id"] = None
+
+
+async def start_live_summary(event: dict, channel, guild) -> None:
+    """Post the live summary for an event and pin it."""
+    if event.get("live_message_id"):
+        return
+
+    buffer = await render_live_image(event, guild)
+    try:
+        message = await channel.send(
+            f"**Live summary — {event['title']}**  ·  updates as people answer",
+            file=discord.File(buffer, filename="rsvp_live.png"),
+        )
+    except discord.HTTPException:
+        return
+
+    event["live_message_id"] = message.id
+    event["live_channel_id"] = channel.id
+
+    try:
+        await message.pin()
+    except discord.HTTPException:
+        pass  # needs Manage Messages, and a channel caps out at 50 pins
+
+
+async def stop_live_summary(event: dict) -> None:
+    """Leave the image in place but mark it as no longer live, and unpin it."""
+    message_id = event.get("live_message_id")
+    if not message_id:
+        return
+    event["live_message_id"] = None
+
+    channel = bot.get_channel(event.get("live_channel_id") or event["channel_id"])
+    if channel is None:
+        return
+
+    message = channel.get_partial_message(message_id)
+    try:
+        await message.edit(
+            content=f"**Summary — {event['title']}**  ·  no longer updating"
+        )
+        await message.unpin()
+    except (discord.HTTPException, discord.NotFound):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1052,9 +1598,107 @@ async def record_button_vote(
     # Editing the message updates the tally and acknowledges the click at once.
     await interaction.response.edit_message(content=button_message_text(event, slot))
     await interaction.followup.send(note, ephemeral=True)
+    schedule_live_refresh(event_id)
+    save_state_soon()
 
     if not clearing and user_id not in _avatar_cache and interaction.guild is not None:
         run_in_background(fetch_avatars(interaction.guild, [user_id]))
+
+
+@bot.tree.command(
+    name="setlivesummary",
+    description="Pin a summary image that redraws itself as people answer",
+)
+@app_commands.describe(enabled="Whether new RSVPs get a live summary")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setlivesummary(interaction: discord.Interaction, enabled: bool):
+    guild_live_summary[interaction.guild_id] = enabled
+    save_state_soon()
+    running = events_for_guild(interaction.guild_id)
+
+    if enabled:
+        await interaction.response.send_message(
+            "New RSVPs will get a pinned summary image that redraws itself as "
+            "people answer.\n"
+            f"• It redraws at most once every {LIVE_REFRESH_DELAY:.0f} seconds. "
+            "Replacing an image means re-uploading it, so a burst of answers "
+            "becomes one redraw rather than twenty.\n"
+            "• It uses the compact grid layout — `/summary` still gives you the "
+            "detailed one.\n"
+            "• Pinning needs Manage Messages; without it the summary still "
+            "works, it just won't be pinned."
+            + (f"\n\nStarting one for the {len(running)} already running."
+               if running else ""),
+            ephemeral=True,
+        )
+        for _, event in running:
+            run_in_background(
+                start_live_summary(
+                    event, bot.get_channel(event["channel_id"]), interaction.guild
+                )
+            )
+    else:
+        await interaction.response.send_message(
+            "Live summaries are off. Any already posted stay in the channel but "
+            "stop updating, and get unpinned.",
+            ephemeral=True,
+        )
+        for _, event in running:
+            run_in_background(stop_live_summary(event))
+
+
+@bot.tree.command(name="rsvps", description="List the RSVPs running on this server")
+async def rsvps(interaction: discord.Interaction):
+    running = events_for_guild(interaction.guild_id)
+    if not running:
+        await interaction.response.send_message(
+            "No RSVPs running. Start one with `/rsvp`.", ephemeral=True
+        )
+        return
+
+    blocks = []
+    for _, event in running:
+        slots = event["slots"]
+        responders = {
+            uid
+            for slot in slots.values()
+            for voters in slot["votes"].values()
+            for uid in voters
+        }
+        first_ts = next(iter(slots.values()))["timestamp"]
+
+        yes_counts = [len(slot["votes"]["✅"]) for slot in slots.values()]
+        best = max(yes_counts, default=0)
+        best_times = [
+            format_slot_time(slot["timestamp"], event["tz"])
+            for slot in slots.values()
+            if len(slot["votes"]["✅"]) == best
+        ]
+
+        details = [MODE_LABELS.get(event["mode"], event["mode"])]
+        if event.get("live_message_id"):
+            details.append("live summary pinned")
+
+        lines = [
+            f"**{event['title']}**",
+            f"{format_slot_date(first_ts, event['tz'])}  ·  "
+            f"{len(slots)} slot{'' if len(slots) == 1 else 's'}  ·  "
+            f"{len(responders)} responded",
+            "  ·  ".join(details),
+        ]
+        if best:
+            shown = ", ".join(best_times[:3])
+            more = f" (+{len(best_times) - 3} more)" if len(best_times) > 3 else ""
+            lines.append(f"Best so far: {shown}{more} — {best} yes")
+
+        blocks.append("\n".join(lines))
+
+    await interaction.response.send_message(
+        f"**{len(running)} of {MAX_ACTIVE_RSVPS} RSVPs running**\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nUse the title with `/summary` or `/reactping` to pick one.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="rsvp", description="Create an RSVP — one message per time slot")
@@ -1103,11 +1747,14 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
         # The mode is recorded here rather than read later, so an RSVP keeps
         # behaving the way it was built even if the server setting changes.
         event = {
+            "id": event_id,
             "title": title,
             "guild_id": interaction.guild_id,
             "channel_id": interaction.channel_id,
             "tz": tz,
             "mode": mode,
+            "live_message_id": None,
+            "live_channel_id": None,
             "slots": slots,
         }
         active_events[event_id] = event
@@ -1153,14 +1800,21 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
         # read the true state back from Discord and merge in anything missed.
         await reconcile_event(active_events[event_id], interaction.channel)
 
+        if wants_live_summary(interaction.guild_id):
+            await start_live_summary(event, interaction.channel, interaction.guild)
+
+        save_state_soon()
+
         if closed:
-            names = ", ".join(f"**{event['title']}**" for event in closed)
+            names = ", ".join(f"**{old['title']}**" for old in closed)
             await interaction.followup.send(
                 f"Closed {names} to stay within {MAX_ACTIVE_RSVPS} running RSVPs. "
                 "Those messages are still in the channel, but reactions on them "
                 "no longer count.",
                 ephemeral=True,
             )
+            for old in closed:
+                run_in_background(stop_live_summary(old))
     except discord.Forbidden:
         await interaction.followup.send(
             "I don't have permission to send messages or add reactions in this channel. "
@@ -1211,6 +1865,10 @@ def forget_event(event_id: str):
     event = active_events.pop(event_id, None)
     if event is None:
         return None
+
+    pending = _live_refresh.pop(event_id, None)
+    if pending is not None and not pending.done():
+        pending.cancel()
 
     for slot in event["slots"].values():
         message_id = slot["message_id"]
@@ -1558,6 +2216,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if event["mode"] == BUTTON_MODE:
         return  # that RSVP answers through its buttons; reactions aren't votes
     slot["votes"][emoji].add(payload.user_id)
+    schedule_live_refresh(event["id"])
+    save_state_soon()
 
     # Warm this person's avatar now, so /summary isn't paying for the download
     # later while someone waits on the image.
@@ -1596,6 +2256,8 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if event["mode"] == BUTTON_MODE:
         return
     slot["votes"][emoji].discard(payload.user_id)
+    schedule_live_refresh(event["id"])
+    save_state_soon()
 
     # If that was the last real reaction the option would disappear from the
     # message, so re-seed it. Claim first, then roll back if the call fails —

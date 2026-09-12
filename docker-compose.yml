@@ -7,3 +7,11 @@ services:
     restart: always
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
+      # Settings and running RSVPs are saved here. Without a volume the file
+      # lives inside the container and is lost when it's recreated.
+      - STATE_FILE=/data/state.json
+    volumes:
+      - pmb-state:/data
+
+volumes:
+  pmb-state:
