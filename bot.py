@@ -26,6 +26,13 @@ STATUS_EMOJIS = {
     "❓": "Maybe",
 }
 
+# The order options must appear in on a message. Discord lays reactions out by
+# when each emoji was first added, so anything that adds one has to follow this
+# sequence. Kept explicit rather than leaning on dict ordering, because the
+# display order is a deliberate choice and shouldn't hinge on how the dict above
+# happens to be written.
+STATUS_ORDER = tuple(STATUS_EMOJIS)
+
 STATUS_COLORS = {
     "✅": (67, 181, 129),
     "❌": (240, 71, 71),
@@ -371,13 +378,23 @@ PLACEHOLDER_COLORS = [
 ]
 
 
+# Avatars download concurrently, but not unboundedly — a large roster
+# shouldn't fire a hundred simultaneous requests at the CDN.
+AVATAR_FETCH_LIMIT = 10
+
+
 async def fetch_avatars(guild: discord.Guild, user_ids) -> dict:
-    """Download each member's avatar once. Returns {user_id: image_bytes}."""
-    avatars = {}
-    for uid in user_ids:
+    """Download each member's avatar once. Returns {user_id: image_bytes}.
+
+    Runs concurrently: fetched one at a time, a full roster added a visible
+    delay to /summary before rendering could begin.
+    """
+    limit = asyncio.Semaphore(AVATAR_FETCH_LIMIT)
+
+    async def fetch_one(uid):
         member = guild.get_member(uid)
         if member is None:
-            continue
+            return uid, None
 
         asset = member.display_avatar
         try:
@@ -387,16 +404,28 @@ async def fetch_avatars(guild: discord.Guild, user_ids) -> dict:
 
         cached = _avatar_cache.get(uid)
         if cached and cached[0] == asset.key:
-            avatars[uid] = cached[1]
-            continue
+            return uid, cached[1]
 
-        try:
-            data = await asset.read()
-        except (discord.HTTPException, discord.NotFound):
-            continue
+        async with limit:
+            try:
+                data = await asset.read()
+            except (discord.HTTPException, discord.NotFound):
+                return uid, None
 
         _avatar_cache[uid] = (asset.key, data)
-        avatars[uid] = data
+        return uid, data
+
+    results = await asyncio.gather(
+        *(fetch_one(uid) for uid in user_ids), return_exceptions=True
+    )
+
+    avatars = {}
+    for result in results:
+        if isinstance(result, BaseException):
+            continue
+        uid, data = result
+        if data is not None:
+            avatars[uid] = data
     return avatars
 
 
@@ -512,7 +541,7 @@ def build_summary_image(
     for slot in event["slots"].values():
         columns = []
         max_rows = 1
-        for emoji in STATUS_EMOJIS:
+        for emoji in STATUS_ORDER:
             voters = slot["votes"][emoji]
             responders.update(voters)
             people = resolve_people(voters)
@@ -793,7 +822,7 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
             }
             message_index[message.id] = (event_id, time_label)
 
-            for emoji in STATUS_EMOJIS:
+            for emoji in STATUS_ORDER:
                 try:
                     await message.add_reaction(emoji)
                 except discord.HTTPException:
@@ -836,6 +865,106 @@ def locate_slot(message_id: int):
     return event["slots"].get(time_label)
 
 
+async def ensure_option_order(message, slot) -> None:
+    """Lay the three options out on `message` in STATUS_ORDER.
+
+    Discord orders reactions by when each emoji was first added, and an emoji
+    whose count falls to zero disappears from the message entirely — so the
+    placeholder the bot re-adds afterwards lands at the end, and ✅ ❌ ❓ drifts
+    into ❌ ❓ ✅.
+
+    Only the bot's own placeholders are ever moved. An option carrying real
+    votes is left exactly where it is, because the sole way to reposition it
+    would be to clear the reaction, which would delete people's responses. So
+    when every option is empty — including a freshly created RSVP — the order
+    is exactly STATUS_ORDER; when some already hold votes, those keep their
+    places and the placeholders are laid out in order after them.
+    """
+    if bot.user is None:
+        return
+
+    current = [
+        str(reaction.emoji)
+        for reaction in message.reactions
+        if str(reaction.emoji) in STATUS_EMOJIS
+    ]
+    # An option with real votes is anchored; the rest are ours to re-lay.
+    movable = [emoji for emoji in STATUS_ORDER if not slot["votes"].get(emoji)]
+    anchored = [emoji for emoji in current if emoji not in movable]
+
+    if current == anchored + movable:
+        return  # already the best arrangement available
+
+    for emoji in movable:
+        if emoji not in current:
+            continue
+        try:
+            await message.remove_reaction(emoji, bot.user)
+        except discord.HTTPException:
+            pass
+        bot_seeded.discard((message.id, emoji))
+
+    # After this loop bot_seeded tells the truth for every movable option:
+    # present if the placeholder actually landed, absent if it didn't, so a
+    # failed add is retried on the next removal instead of stranding the
+    # option as permanently unclickable.
+    for emoji in movable:
+        key = (message.id, emoji)
+        try:
+            await message.add_reaction(emoji)
+        except discord.HTTPException:
+            bot_seeded.discard(key)
+            continue
+        bot_seeded.add(key)
+
+
+async def read_reaction_voters(reaction) -> set:
+    """Page through a reaction's users, excluding the bot's own placeholder."""
+    voters = set()
+    async for user in reaction.users():
+        if bot.user is None or user.id != bot.user.id:
+            voters.add(user.id)
+    return voters
+
+
+async def reconcile_slot(channel, slot: dict) -> None:
+    try:
+        message = await channel.fetch_message(slot["message_id"])
+    except (discord.HTTPException, discord.NotFound):
+        return
+
+    relevant = [r for r in message.reactions if str(r.emoji) in STATUS_EMOJIS]
+    pages = await asyncio.gather(
+        *(read_reaction_voters(reaction) for reaction in relevant),
+        return_exceptions=True,
+    )
+
+    votes = {emoji: set() for emoji in STATUS_EMOJIS}
+    for reaction, result in zip(relevant, pages):
+        emoji = str(reaction.emoji)
+        if isinstance(result, BaseException):
+            # Couldn't page this one — keep the tally we already had rather
+            # than silently zeroing real votes.
+            votes[emoji] = set(slot["votes"].get(emoji, ()))
+        else:
+            votes[emoji] = result
+
+    slot["votes"] = votes
+
+    for emoji in STATUS_ORDER:
+        key = (slot["message_id"], emoji)
+        if votes[emoji] and key in bot_seeded:
+            # Real votes landed here, so the bot's placeholder is no longer
+            # needed and would otherwise inflate the count.
+            bot_seeded.discard(key)
+            try:
+                await message.remove_reaction(emoji, bot.user)
+            except discord.HTTPException:
+                pass
+
+    await ensure_option_order(message, slot)
+
+
 async def reconcile_event(event: dict, channel) -> None:
     """Re-read the real reaction state from Discord into the event.
 
@@ -843,52 +972,18 @@ async def reconcile_event(event: dict, channel) -> None:
     or if the gateway drops events across a reconnect. This resyncs the tally
     to what Discord actually holds, so a missed click is recovered rather than
     lost until someone re-reacts.
+
+    Slots are reconciled concurrently. Done one at a time, a seven-slot RSVP
+    meant roughly thirty sequential round trips before /summary could even
+    start rendering.
     """
     if channel is None:
         return
 
-    for slot in event["slots"].values():
-        try:
-            message = await channel.fetch_message(slot["message_id"])
-        except (discord.HTTPException, discord.NotFound):
-            continue
-
-        votes = {emoji: set() for emoji in STATUS_EMOJIS}
-        present = set()
-
-        for reaction in message.reactions:
-            emoji = str(reaction.emoji)
-            if emoji not in STATUS_EMOJIS:
-                continue
-            present.add(emoji)
-            try:
-                async for user in reaction.users():
-                    if bot.user is None or user.id != bot.user.id:
-                        votes[emoji].add(user.id)
-            except discord.HTTPException:
-                # Couldn't page this one — keep the tally we already had
-                # rather than silently zeroing real votes.
-                votes[emoji] = set(slot["votes"].get(emoji, ()))
-
-        slot["votes"] = votes
-
-        for emoji in STATUS_EMOJIS:
-            key = (slot["message_id"], emoji)
-            if votes[emoji] and key in bot_seeded:
-                # Real votes landed here, so the bot's placeholder is no
-                # longer needed and would otherwise inflate the count.
-                bot_seeded.discard(key)
-                try:
-                    await message.remove_reaction(emoji, bot.user)
-                except discord.HTTPException:
-                    pass
-            elif emoji not in present and not votes[emoji]:
-                # The option vanished entirely — nobody could click it.
-                try:
-                    await message.add_reaction(emoji)
-                except discord.HTTPException:
-                    continue
-                bot_seeded.add(key)
+    await asyncio.gather(
+        *(reconcile_slot(channel, slot) for slot in event["slots"].values()),
+        return_exceptions=True,
+    )
 
 
 @bot.event
@@ -938,16 +1033,22 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     key = (payload.message_id, emoji)
     if slot["votes"][emoji] or key in bot_seeded:
         return
-    bot_seeded.add(key)
+    bot_seeded.add(key)  # claim, so two removals don't both re-lay the options
 
-    message = partial_message(payload.channel_id, payload.message_id)
-    if message is None:
+    # A re-added emoji lands at the end of the message, so this re-lays the
+    # placeholders rather than just adding one back — otherwise the options
+    # drift out of ✅ ❌ ❓ order the first time a vote is fully withdrawn.
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
         bot_seeded.discard(key)
         return
     try:
-        await message.add_reaction(emoji)
-    except discord.HTTPException:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.HTTPException, discord.NotFound):
         bot_seeded.discard(key)
+        return
+
+    await ensure_option_order(message, slot)
 
 
 @bot.tree.command(name="reactping", description="Ping roster members missing a reaction on any time slot")
