@@ -18,7 +18,7 @@ intents.members = True  # needed to iterate role members for /reactping
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DEFAULT_TIME_SLOTS = ["8:00", "8:30", "9:00", "9:30", "10:00", "10:30", "11:00"]
+DEFAULT_TIME_SLOTS = ["19:00", "19:30", "20:00", "20:30", "21:00", "21:30", "22:00"]
 
 STATUS_EMOJIS = {
     "✅": "Yes",
@@ -768,21 +768,9 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
         event_id = str(uuid.uuid4())
         slots = {}
 
-        for time_label in time_slots:
-            ts = build_timestamp(time_label, date_str, tz)
-            message = await interaction.channel.send(f"**{title} — <t:{ts}:t>**")
-            for emoji in STATUS_EMOJIS:
-                await message.add_reaction(emoji)
-                bot_seeded.add((message.id, emoji))
-
-            votes = {emoji: set() for emoji in STATUS_EMOJIS}
-            slots[time_label] = {
-                "message_id": message.id,
-                "timestamp": ts,
-                "votes": votes,
-            }
-            message_index[message.id] = (event_id, time_label)
-
+        # Register the event up front. Seeding 3 reactions across every slot
+        # takes many rate-limited round trips, and until this dict existed any
+        # reaction arriving mid-creation raised a KeyError in the handler.
         active_events[event_id] = {
             "title": title,
             "guild_id": interaction.guild_id,
@@ -791,6 +779,30 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
             "slots": slots,
         }
         last_event[interaction.guild_id] = event_id
+
+        for time_label in time_slots:
+            ts = build_timestamp(time_label, date_str, tz)
+            message = await interaction.channel.send(f"**{title} — <t:{ts}:t>**")
+
+            # Index the slot BEFORE seeding its reactions, so someone clicking
+            # the instant the message appears is recorded rather than dropped.
+            slots[time_label] = {
+                "message_id": message.id,
+                "timestamp": ts,
+                "votes": {emoji: set() for emoji in STATUS_EMOJIS},
+            }
+            message_index[message.id] = (event_id, time_label)
+
+            for emoji in STATUS_EMOJIS:
+                try:
+                    await message.add_reaction(emoji)
+                except discord.HTTPException:
+                    continue
+                bot_seeded.add((message.id, emoji))
+
+        # Narrow races remain between sending a message and indexing it, so
+        # read the true state back from Discord and merge in anything missed.
+        await reconcile_event(active_events[event_id], interaction.channel)
     except discord.Forbidden:
         await interaction.followup.send(
             "I don't have permission to send messages or add reactions in this channel. "
@@ -799,61 +811,143 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
         )
 
 
+def partial_message(channel_id: int, message_id: int):
+    """A message handle that costs no HTTP request.
+
+    The reaction handlers only ever add or remove a reaction, which needs an
+    id rather than the message body — fetching it made every click a second
+    API call and made rapid reacting hit rate limits much sooner.
+    """
+    channel = bot.get_channel(channel_id)
+    if channel is None or not hasattr(channel, "get_partial_message"):
+        return None
+    return channel.get_partial_message(message_id)
+
+
+def locate_slot(message_id: int):
+    """Resolve a message id to its slot, or None if it isn't a live RSVP."""
+    lookup = message_index.get(message_id)
+    if not lookup:
+        return None
+    event_id, time_label = lookup
+    event = active_events.get(event_id)
+    if event is None:
+        return None
+    return event["slots"].get(time_label)
+
+
+async def reconcile_event(event: dict, channel) -> None:
+    """Re-read the real reaction state from Discord into the event.
+
+    Reaction events can be missed — while the bot is busy seeding a new RSVP,
+    or if the gateway drops events across a reconnect. This resyncs the tally
+    to what Discord actually holds, so a missed click is recovered rather than
+    lost until someone re-reacts.
+    """
+    if channel is None:
+        return
+
+    for slot in event["slots"].values():
+        try:
+            message = await channel.fetch_message(slot["message_id"])
+        except (discord.HTTPException, discord.NotFound):
+            continue
+
+        votes = {emoji: set() for emoji in STATUS_EMOJIS}
+        present = set()
+
+        for reaction in message.reactions:
+            emoji = str(reaction.emoji)
+            if emoji not in STATUS_EMOJIS:
+                continue
+            present.add(emoji)
+            try:
+                async for user in reaction.users():
+                    if bot.user is None or user.id != bot.user.id:
+                        votes[emoji].add(user.id)
+            except discord.HTTPException:
+                # Couldn't page this one — keep the tally we already had
+                # rather than silently zeroing real votes.
+                votes[emoji] = set(slot["votes"].get(emoji, ()))
+
+        slot["votes"] = votes
+
+        for emoji in STATUS_EMOJIS:
+            key = (slot["message_id"], emoji)
+            if votes[emoji] and key in bot_seeded:
+                # Real votes landed here, so the bot's placeholder is no
+                # longer needed and would otherwise inflate the count.
+                bot_seeded.discard(key)
+                try:
+                    await message.remove_reaction(emoji, bot.user)
+                except discord.HTTPException:
+                    pass
+            elif emoji not in present and not votes[emoji]:
+                # The option vanished entirely — nobody could click it.
+                try:
+                    await message.add_reaction(emoji)
+                except discord.HTTPException:
+                    continue
+                bot_seeded.add(key)
+
+
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
+    if bot.user is None or payload.user_id == bot.user.id:
         return
-    lookup = message_index.get(payload.message_id)
-    if not lookup:
-        return
-    event_id, time_label = lookup
     emoji = str(payload.emoji)
     if emoji not in STATUS_EMOJIS:
         return
 
-    event = active_events[event_id]
-    slot = event["slots"][time_label]
+    slot = locate_slot(payload.message_id)
+    if slot is None:
+        return
     slot["votes"][emoji].add(payload.user_id)
 
-    # A real person just reacted with this emoji — remove the bot's own
-    # seed reaction on this emoji so it stops inflating the count.
+    # A real person reacted, so drop the bot's seed to stop it inflating the
+    # count. Claim the key before awaiting: several people reacting at once
+    # would otherwise each fire their own removal request.
     key = (payload.message_id, emoji)
-    if key in bot_seeded:
-        channel = bot.get_channel(payload.channel_id)
-        try:
-            message = await channel.fetch_message(payload.message_id)
-            await message.remove_reaction(emoji, bot.user)
-        except discord.HTTPException:
-            pass
-        bot_seeded.discard(key)
+    if key not in bot_seeded:
+        return
+    bot_seeded.discard(key)
+
+    message = partial_message(payload.channel_id, payload.message_id)
+    if message is None:
+        return
+    try:
+        await message.remove_reaction(emoji, bot.user)
+    except discord.HTTPException:
+        pass
 
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    lookup = message_index.get(payload.message_id)
-    if not lookup:
-        return
-    event_id, time_label = lookup
     emoji = str(payload.emoji)
     if emoji not in STATUS_EMOJIS:
         return
 
-    event = active_events[event_id]
-    slot = event["slots"][time_label]
+    slot = locate_slot(payload.message_id)
+    if slot is None:
+        return
     slot["votes"][emoji].discard(payload.user_id)
 
-    # If that was the last real reaction on this emoji, the option would
-    # vanish from the message entirely — re-add the bot's seed reaction
-    # so people can still click it.
+    # If that was the last real reaction the option would disappear from the
+    # message, so re-seed it. Claim first, then roll back if the call fails —
+    # marking it seeded regardless used to strand the option permanently.
     key = (payload.message_id, emoji)
-    if not slot["votes"][emoji] and key not in bot_seeded:
-        channel = bot.get_channel(payload.channel_id)
-        try:
-            message = await channel.fetch_message(payload.message_id)
-            await message.add_reaction(emoji)
-        except discord.HTTPException:
-            pass
-        bot_seeded.add(key)
+    if slot["votes"][emoji] or key in bot_seeded:
+        return
+    bot_seeded.add(key)
+
+    message = partial_message(payload.channel_id, payload.message_id)
+    if message is None:
+        bot_seeded.discard(key)
+        return
+    try:
+        await message.add_reaction(emoji)
+    except discord.HTTPException:
+        bot_seeded.discard(key)
 
 
 @bot.tree.command(name="reactping", description="Ping roster members missing a reaction on any time slot")
@@ -883,6 +977,11 @@ async def reactping(interaction: discord.Interaction):
 
     event = active_events[event_id]
 
+    # Resync before naming names — pinging someone who did respond, because
+    # their reaction was missed, is worse than the command being a bit slow.
+    await interaction.response.defer()
+    await reconcile_event(event, bot.get_channel(event["channel_id"]))
+
     # A member "reacted" to a time slot if they used ANY of the 3 status
     # emojis on that slot's message. They need to have reacted to EVERY slot.
     missing_people = []
@@ -901,13 +1000,13 @@ async def reactping(interaction: discord.Interaction):
             missing_people.append(member)
 
     if not missing_people:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Everyone in {role.mention} has responded to every time slot. ✅"
         )
         return
 
     mentions = " ".join(m.mention for m in missing_people)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"⏰ Reminder for **{event['title']}** — you're missing a response on at least one time slot: {mentions}"
     )
 
@@ -926,6 +1025,10 @@ async def summary(interaction: discord.Interaction):
     await interaction.response.defer()
 
     event = active_events[event_id]
+
+    # Pull the true reaction state first, so the image reflects Discord rather
+    # than whatever the in-memory tally happens to hold.
+    await reconcile_event(event, bot.get_channel(event["channel_id"]))
 
     voter_ids = {
         uid
