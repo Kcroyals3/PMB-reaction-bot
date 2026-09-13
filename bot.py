@@ -485,6 +485,12 @@ def format_zone_label(ts: int, tz) -> str:
     return slot_datetime(ts, tz).strftime("%Z")
 
 
+def format_slot_date_short(ts: int, tz) -> str:
+    """Compact date for a message headline, e.g. 'Fri Sep 18'."""
+    dt = slot_datetime(ts, tz)
+    return f"{dt.strftime('%a %b')} {dt.day}"
+
+
 # Plain-text labels instead of unicode emoji for the column headers — keeps
 # them legible even when no color-emoji font is installed.
 STATUS_LABELS = {
@@ -1848,12 +1854,18 @@ BUTTON_STYLES = {
 
 
 def slot_headline(event: dict, slot: dict) -> str:
-    """Bold server-time headline, with the viewer-localized time trailing it."""
+    """Bold server date and time, with the viewer-localized version trailing it.
+
+    The date is on every slot message rather than expected in the title. It also
+    has to be on the localized half: a 10:00 PM Eastern slot is 3:00 AM the next
+    day in the UK, and a bare time would have quietly said 3:00 AM today.
+    """
     ts = slot["timestamp"]
     tz = event["tz"]
     return (
-        f"**{event['title']} — {format_slot_time(ts, tz)} {format_zone_label(ts, tz)}**"
-        f"  ·  your local time: <t:{ts}:t>"
+        f"**{event['title']} — {format_slot_date_short(ts, tz)}, "
+        f"{format_slot_time(ts, tz)} {format_zone_label(ts, tz)}**"
+        f"  ·  your local time: <t:{ts}:f>"
     )
 
 

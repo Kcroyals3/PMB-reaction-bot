@@ -7,9 +7,9 @@ Commands
 
 Posts one message per time slot, formatted as:
 
-**Movie Night — 8:00 PM EDT**  ·  your local time: 5:00 PM
+**Movie Night — Fri Sep 18, 8:00 PM EDT**  ·  your local time: 18 September 2026 17:00
 
-The server's timezone leads, so everyone sees the same time when comparing slots or quoting one back to each other. The trailing time is a Discord timestamp (<t:...:t>), which Discord renders in each reader's own timezone.
+The date is on every slot message, so it doesn't need to go in the title. The server's timezone leads, so everyone sees the same time when comparing slots or quoting one back to each other. The trailing half is a Discord timestamp (<t:...:f>), which Discord renders in each reader's own timezone — date included, because a 10:00 PM Eastern slot is 3:00 AM the next day in the UK and a bare time would quietly say 3:00 AM today.
 
 title — what people are RSVPing to (e.g. "Movie Night")
 date (optional) — defaults to today. Written however you like:
