@@ -104,13 +104,15 @@ channel — where to post it. Leave blank and each summary appears in whichever 
 
 mode — "One summary per RSVP" (default), or "A single summary that follows the newest RSVP". The second suits a dedicated summary channel: each new RSVP takes over the same message, so there's always exactly one and it's always current. Older RSVPs stop writing to it.
 
-pin — whether to pin it. On by default. Pinning needs Manage Messages; if the bot doesn't have it the summary still posts, just unpinned, and the command tells you so up front.
+pin — whether to pin it. Off by default, since pinning needs Manage Messages (which the bot often doesn't have) and a channel only holds 50 pins. Pass pin: True to turn it on; if the permission is missing the summary still posts, just unpinned, and the command tells you so up front.
 
 It uses the compact grid layout (people down the side, slots across the top) rather than the detailed card layout, because a live image lives in the channel permanently — the grid says the same thing in about a quarter of the height.
 
 It redraws at most once every 4 seconds. Replacing a message's image means re-uploading it, so a burst of twenty answers becomes one redraw rather than twenty.
 
-Turning it off leaves the image in place, marks it as no longer updating, and unpins it.
+cleanup — whether posting a new summary deletes the previous one, so the channel holds one instead of a growing pile. Off by default, since a deleted message can't be brought back. The new summary is posted first and the old one removed after, so the channel is never briefly left without one. Note that older RSVPs still running lose their live summary this way — /summary still works for them. In "follows the newest" mode this setting does nothing, because there's only ever one message to begin with.
+
+Turning the whole thing off leaves the image in place, marks it as no longer updating, and unpins it — unless cleanup is on, in which case it's deleted.
 
 /closersvp <title> [delete_messages]
 

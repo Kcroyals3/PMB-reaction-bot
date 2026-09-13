@@ -144,7 +144,19 @@ guild_live_pin = {}
 
 
 def wants_pinned_summary(guild_id) -> bool:
-    return bool(guild_live_pin.get(guild_id, True))
+    # Off by default: pinning needs a permission the bot often doesn't have,
+    # and a channel only holds 50 pins, so opting in is the safer default.
+    return bool(guild_live_pin.get(guild_id, False))
+
+
+# guild_id -> bool. Whether posting a new live summary deletes the previous
+# one, so the channel holds one rather than a growing pile. Off by default,
+# because deleting a message can't be undone.
+guild_live_cleanup = {}
+
+
+def wants_summary_cleanup(guild_id) -> bool:
+    return bool(guild_live_cleanup.get(guild_id, False))
 
 
 # How the viewer-localized half of a slot message reads. The keys are Discord's
@@ -1399,6 +1411,7 @@ def serialize_state() -> dict:
         "guild_live_mode": {str(k): v for k, v in guild_live_mode.items()},
         "guild_live_message": {str(k): v for k, v in guild_live_message.items()},
         "guild_live_pin": {str(k): bool(v) for k, v in guild_live_pin.items()},
+        "guild_live_cleanup": {str(k): bool(v) for k, v in guild_live_cleanup.items()},
         "guild_timestamp_style": {
             str(k): v for k, v in guild_timestamp_style.items()
         },
@@ -1499,6 +1512,9 @@ def load_state() -> None:
     )
     guild_live_pin.update(
         {int(k): bool(v) for k, v in data.get("guild_live_pin", {}).items()}
+    )
+    guild_live_cleanup.update(
+        {int(k): bool(v) for k, v in data.get("guild_live_cleanup", {}).items()}
     )
     guild_timestamp_style.update(
         {
@@ -1965,6 +1981,13 @@ async def start_live_summary(event: dict, fallback_channel, guild) -> None:
     if guild_live_mode.get(guild_id, LIVE_EACH) == LIVE_LATEST:
         guild_live_message[guild_id] = message.id
 
+    # Clear out the older ones only once the replacement is up, so the channel
+    # is never briefly left without a summary.
+    if wants_summary_cleanup(guild_id):
+        for _, older in events_for_guild(guild_id):
+            if older is not event and older.get("live_message_id"):
+                run_in_background(remove_live_summary(older))
+
     if wants_pinned_summary(guild_id):
         try:
             await message.pin()
@@ -1972,8 +1995,30 @@ async def start_live_summary(event: dict, fallback_channel, guild) -> None:
             pass  # needs Manage Messages, and a channel caps out at 50 pins
 
 
+async def remove_live_summary(event: dict) -> None:
+    """Delete an event's live summary outright."""
+    message_id = event.get("live_message_id")
+    if not message_id:
+        return
+    event["live_message_id"] = None
+    if guild_live_message.get(event["guild_id"]) == message_id:
+        guild_live_message.pop(event["guild_id"], None)
+
+    channel = bot.get_channel(event.get("live_channel_id") or event["channel_id"])
+    if channel is None:
+        return
+    try:
+        await channel.get_partial_message(message_id).delete()
+    except (discord.HTTPException, discord.NotFound):
+        pass
+
+
 async def stop_live_summary(event: dict) -> None:
     """Leave the image in place but mark it as no longer live, and unpin it."""
+    if wants_summary_cleanup(event["guild_id"]):
+        await remove_live_summary(event)
+        return
+
     message_id = event.get("live_message_id")
     if not message_id:
         return
@@ -2104,13 +2149,14 @@ async def record_button_vote(
 
 @bot.tree.command(
     name="setlivesummary",
-    description="Pin a summary image that redraws itself as people answer",
+    description="Post a summary image that redraws itself as people answer",
 )
 @app_commands.describe(
     enabled="Whether new RSVPs get a live summary",
     channel="Where to post it — leave blank to use whichever channel the RSVP is in",
     mode="One summary per RSVP, or a single one that follows the newest",
-    pin="Whether to pin it (default: yes)",
+    pin="Whether to pin it (default: no)",
+    cleanup="Delete the previous summary when a new one is posted (default: no)",
 )
 @app_commands.choices(
     mode=[
@@ -2127,6 +2173,7 @@ async def setlivesummary(
     channel: discord.TextChannel = None,
     mode: str = None,
     pin: bool = None,
+    cleanup: bool = None,
 ):
     # Check up front rather than letting the post fail quietly in the
     # background, where nobody would ever see the error.
@@ -2163,6 +2210,8 @@ async def setlivesummary(
         guild_live_mode[guild_id] = chosen_mode
     if pin is not None:
         guild_live_pin[guild_id] = pin
+    if cleanup is not None:
+        guild_live_cleanup[guild_id] = cleanup
 
     save_state_soon()
     running = events_for_guild(guild_id)
@@ -2181,11 +2230,17 @@ async def setlivesummary(
                 "message, so there's always exactly one and it's always the "
                 "newest. Older ones stop updating it."
             )
+        elif wants_summary_cleanup(guild_id):
+            mode_note = (
+                "• Each RSVP gets its own summary, and posting a new one "
+                "**deletes** the previous. Older RSVPs that are still running "
+                "lose their live summary — `/summary` still works for them."
+            )
         else:
             mode_note = "• Each RSVP gets its own summary."
 
         if not wants_pinned_summary(guild_id):
-            pin_note = "• It won't be pinned."
+            pin_note = "• It won't be pinned — run this again with `pin: True` if you want that."
         else:
             pin_note = (
                 "• Pinning needs Manage Messages; without it the summary still "
