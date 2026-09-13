@@ -7,12 +7,20 @@ Commands
 
 Posts one message per time slot, formatted as:
 
-**Movie Night — 8:00 PM EDT**  ·  your local time: 5:00 PM
+**Movie Night — Fri Sep 18, 8:00 PM EDT**  ·  your local time: 18 September 2026 17:00
 
-The server's timezone leads, so everyone sees the same time when comparing slots or quoting one back to each other. The trailing time is a Discord timestamp (<t:...:t>), which Discord renders in each reader's own timezone.
+The date is on every slot message, so it doesn't need to go in the title. The server's timezone leads, so everyone sees the same time when comparing slots or quoting one back to each other. The trailing half is a Discord timestamp (<t:...:f>), which Discord renders in each reader's own timezone — date included, because a 10:00 PM Eastern slot is 3:00 AM the next day in the UK and a bare time would quietly say 3:00 AM today.
 
 title — what people are RSVPing to (e.g. "Movie Night")
-date (optional) — YYYY-MM-DD, defaults to today
+date (optional) — defaults to today. Written however you like:
+
+  today, tonight, tomorrow, tmr
+  friday, fri, next friday
+  in 3 days, +5, 10 days
+  9/12, 9-12, 9/12/26, 2026-09-12
+  sep 12, september 12th, 12 sept, Dec 25 2027
+
+A date with no year rolls forward — typing 1/5 in December means next January, not ten months ago. Slash dates are read US-style (month first), except where the first number can't be a month, which makes 18/9 unambiguous. /rsvp echoes back the date it settled on, so a misread is visible rather than silent.
 
 Each message gets ✅ (yes), ❌ (no), and ❓ (maybe) reactions — or three buttons instead, depending on /setvoting.
 
@@ -74,15 +82,27 @@ Because it's an image rather than Discord markdown, it cannot localize per viewe
 
 Lists what's running on this server: each title, its date, how many slots and how many people have answered, which voting mode it uses, whether it has a live summary pinned, and the best turnout so far. Use a title from here with /summary or /reactping.
 
-/setlivesummary <enabled>
+/setlivesummary <enabled> [channel] [mode] [pin]
 
-Pins a summary image that redraws itself as people answer, so nobody has to run /summary to see where things stand. Requires Manage Server permission.
+Posts a summary image that redraws itself as people answer, so nobody has to run /summary to see where things stand. Requires Manage Server permission.
+
+channel — where to post it. Leave blank and each summary appears in whichever channel its RSVP was created in. Give a channel and they all go there instead, each captioned with a link back to where to actually answer. The bot's permissions there (View Channel, Send Messages, Attach Files) are checked when you set it, rather than failing silently later.
+
+mode — "One summary per RSVP" (default), or "A single summary that follows the newest RSVP". The second suits a dedicated summary channel: each new RSVP takes over the same message, so there's always exactly one and it's always current. Older RSVPs stop writing to it.
+
+pin — whether to pin it. On by default. Pinning needs Manage Messages; if the bot doesn't have it the summary still posts, just unpinned, and the command tells you so up front.
 
 It uses the compact grid layout (people down the side, slots across the top) rather than the detailed card layout, because a live image lives in the channel permanently — the grid says the same thing in about a quarter of the height.
 
-It redraws at most once every 4 seconds. Replacing a message's image means re-uploading it, so a burst of twenty answers becomes one redraw rather than twenty. Pinning needs Manage Messages; without it the summary still works, just unpinned.
+It redraws at most once every 4 seconds. Replacing a message's image means re-uploading it, so a burst of twenty answers becomes one redraw rather than twenty.
 
 Turning it off leaves the image in place, marks it as no longer updating, and unpins it.
+
+/closersvp <title> [delete_messages]
+
+Stops tracking an RSVP before the 3-at-once cap pushes it out, freeing a slot. Requires Manage Server permission.
+
+By default its messages stay in the channel, marked "Closed — no longer counting answers" with any buttons removed, so the result is still readable but obviously final. Pass delete_messages to remove them instead. Its live summary is stopped and unpinned either way.
 
 /setroster <role>
 
@@ -121,5 +141,5 @@ In Docker this needs a volume, or the file lives inside the container and disapp
 Writes are atomic (written to a temp file, then renamed) so a crash mid-write can't leave a truncated file, and they're batched — a burst of answers is one write, not twenty. A state file that's corrupt or written by a different version is reported and ignored rather than crashing the bot.
 
 Notes
-Up to 3 RSVPs are tracked per server at once; creating a fourth closes the oldest and stops tracking reactions on its messages.
+Up to 3 RSVPs are tracked per server at once; creating a fourth closes the oldest and stops tracking reactions on its messages. Use /closersvp to close one yourself.
 Button RSVPs have their views re-registered on startup, so their buttons keep working across a restart.

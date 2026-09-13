@@ -100,6 +100,10 @@ guild_seed_mode = {}
 # guild_id -> bool. Whether a new RSVP gets a pinned, self-updating summary.
 guild_live_summary = {}
 
+# guild_id -> channel_id to post live summaries in. Absent means "wherever the
+# RSVP itself was created", which is the default.
+guild_live_channel = {}
+
 
 def guild_mode(guild_id) -> str:
     return guild_seed_mode.get(guild_id, CLEAR_PLACEHOLDERS)
@@ -107,6 +111,134 @@ def guild_mode(guild_id) -> str:
 
 def wants_live_summary(guild_id) -> bool:
     return bool(guild_live_summary.get(guild_id, False))
+
+
+def live_summary_channel(guild_id, fallback):
+    """Where this guild's live summaries go.
+
+    Falls back to the RSVP's own channel if none is configured, or if the
+    configured one has since been deleted or hidden from the bot — better a
+    summary in the wrong place than none at all.
+    """
+    channel_id = guild_live_channel.get(guild_id)
+    if channel_id is None:
+        return fallback
+    return bot.get_channel(channel_id) or fallback
+
+
+# Whether each RSVP gets its own live summary, or one message follows whichever
+# RSVP is newest. The latter suits a dedicated summary channel: one pinned
+# message that's always current, instead of a growing pile of them.
+LIVE_EACH = "each"
+LIVE_LATEST = "latest"
+LIVE_MODES = (LIVE_EACH, LIVE_LATEST)
+
+# guild_id -> one of the above
+guild_live_mode = {}
+
+# guild_id -> the shared message id, in "latest" mode only
+guild_live_message = {}
+
+# guild_id -> bool. Whether to pin the live summary. Defaults to pinning.
+guild_live_pin = {}
+
+
+def wants_pinned_summary(guild_id) -> bool:
+    return bool(guild_live_pin.get(guild_id, True))
+
+
+def events_for_guild(guild_id: int) -> list:
+    """This guild's live RSVPs as (event_id, event), oldest first."""
+    return [
+        (event_id, active_events[event_id])
+        for event_id in guild_events.get(guild_id, [])
+        if event_id in active_events
+    ]
+
+
+def forget_event(event_id: str):
+    """Stop tracking an RSVP and drop every trace of its messages."""
+    event = active_events.pop(event_id, None)
+    if event is None:
+        return None
+
+    pending = _live_refresh.pop(event_id, None)
+    if pending is not None and not pending.done():
+        pending.cancel()
+
+    for slot in event["slots"].values():
+        message_id = slot["message_id"]
+        message_index.pop(message_id, None)
+        _order_locks.pop(message_id, None)
+        for emoji in STATUS_ORDER:
+            bot_seeded.discard((message_id, emoji))
+    return event
+
+
+def register_event(guild_id: int, event_id: str) -> list:
+    """Track a new RSVP, closing the oldest if that puts the guild over the cap.
+
+    Returns the events that were closed. This is also what keeps message_index
+    and bot_seeded from growing forever in a long-running process.
+    """
+    event_ids = guild_events.setdefault(guild_id, [])
+    event_ids.append(event_id)
+
+    closed = []
+    while len(event_ids) > MAX_ACTIVE_RSVPS:
+        evicted = forget_event(event_ids.pop(0))
+        if evicted is not None:
+            closed.append(evicted)
+    return closed
+
+
+def close_event(guild_id: int, event_id: str):
+    """Close an RSVP on purpose, rather than because the cap pushed it out."""
+    event_ids = guild_events.get(guild_id)
+    if event_ids and event_id in event_ids:
+        event_ids.remove(event_id)
+    return forget_event(event_id)
+
+
+def resolve_event(guild_id: int, title):
+    """Pick the RSVP a command means. Returns ((event_id, event), None) or
+    (None, message) explaining what to do instead."""
+    live = events_for_guild(guild_id)
+    if not live:
+        return None, "No RSVP found. Run `/rsvp` first."
+
+    listing = ", ".join(f"`{event['title']}`" for _, event in live)
+
+    if title is None:
+        if len(live) == 1:
+            return live[0], None
+        return None, (
+            f"There are {len(live)} RSVPs running — say which one you mean: {listing}"
+        )
+
+    needle = title.strip().casefold()
+    exact = [pair for pair in live if pair[1]["title"].casefold() == needle]
+    if len(exact) == 1:
+        return exact[0], None
+
+    partial = [pair for pair in live if needle in pair[1]["title"].casefold()]
+    if len(partial) == 1:
+        return partial[0], None
+    if len(partial) > 1:
+        matches = ", ".join(f"`{event['title']}`" for _, event in partial)
+        return None, f"`{title}` matches more than one RSVP: {matches}"
+
+    return None, f"No RSVP called `{title}`. Running now: {listing}"
+
+
+async def rsvp_title_autocomplete(interaction: discord.Interaction, current: str):
+    """Offer the guild's live RSVP titles as you type."""
+    needle = (current or "").casefold()
+    return [
+        app_commands.Choice(name=event["title"][:100], value=event["title"][:100])
+        for _, event in events_for_guild(interaction.guild_id)
+        if needle in event["title"].casefold()
+    ][:25]
 
 # guild_id -> tzinfo. Named IANA zones rather than fixed offsets, so a server
 # set to Eastern stays correct across the EST/EDT changeover instead of
@@ -195,6 +327,123 @@ def parse_time(value: str):
     return hour, minute
 
 
+WEEKDAY_NAMES = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1, "tuesday's": 1,
+    "wednesday": 2, "wed": 2, "weds": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+MONTH_NAMES = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+
+def _build_date(year, month, day, today):
+    """Assemble a date, rolling a yearless one forward if it's already gone.
+
+    Someone typing "1/5" in December means next January, not ten months ago.
+    """
+    try:
+        if year is not None:
+            return datetime(year, month, day).date()
+        candidate = datetime(today.year, month, day).date()
+        if candidate < today:
+            candidate = datetime(today.year + 1, month, day).date()
+        return candidate
+    except ValueError:
+        return None  # 31 February, and friends
+
+
+def parse_date(value: str, today):
+    """Read a date the way people write one, or None if it can't be read.
+
+    Handles "today", "tomorrow", "friday", "next friday", "in 3 days",
+    "2026-09-12", "9/12", "9/12/26", "sep 12", "12 sept", "September 12 2026".
+
+    Slash dates are read US-style (month first), since that's what this bot's
+    default timezone implies — except when the first number can't be a month,
+    which makes "13/5" unambiguous. /rsvp echoes back the date it settled on,
+    so a misread is visible rather than silent.
+    """
+    text = re.sub(r"\s+", " ", value.strip().lower().replace(",", " ")).strip()
+    if not text:
+        return None
+
+    if text in ("today", "tonight", "tonite", "now"):
+        return today
+    if text in ("tomorrow", "tmr", "tmrw", "tom", "tomorow"):
+        return today + timedelta(days=1)
+    if text in ("day after tomorrow", "overmorrow"):
+        return today + timedelta(days=2)
+
+    match = re.fullmatch(r"(?:in )?\+?(\d{1,3})(?: ?d| ?days?)?", text)
+    if match and (text.startswith("in ") or text.startswith("+") or text[-1] in "sd"):
+        return today + timedelta(days=int(match.group(1)))
+
+    match = re.fullmatch(r"(next|this|coming)? ?([a-z']+)", text)
+    if match and match.group(2) in WEEKDAY_NAMES:
+        ahead = (WEEKDAY_NAMES[match.group(2)] - today.weekday()) % 7
+        if match.group(1) == "next":
+            # "next friday" means the one after this week's, even mid-week.
+            ahead += 7 if ahead else 7
+        return today + timedelta(days=ahead)
+
+    match = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if match:
+        return _build_date(
+            int(match.group(1)), int(match.group(2)), int(match.group(3)), today
+        )
+
+    match = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{2,4}))?", text)
+    if match:
+        first, second = int(match.group(1)), int(match.group(2))
+        month, day = first, second
+        if first > 12 >= second:
+            month, day = second, first  # can only be day-first
+        year = match.group(3)
+        if year is not None:
+            year = int(year)
+            if year < 100:
+                year += 2000
+        return _build_date(year, month, day, today)
+
+    month = day = year = None
+    for token in text.replace(" of ", " ").split(" "):
+        token = token.strip(".")
+        if token in MONTH_NAMES:
+            month = MONTH_NAMES[token]
+            continue
+        digits = re.sub(r"(st|nd|rd|th)$", "", token)
+        if not digits.isdigit():
+            return None
+        number = int(digits)
+        if number >= 1000 or (day is not None and year is None):
+            year = number
+        elif day is None:
+            day = number
+        else:
+            return None
+
+    if month is None or day is None:
+        return None
+    return _build_date(year, month, day, today)
+
+
 def format_label(label: str) -> str:
     """Render a stored 'HH:MM' slot label the way people read times."""
     parsed = parse_time(label)
@@ -234,6 +483,12 @@ def format_slot_date(ts: int, tz) -> str:
 def format_zone_label(ts: int, tz) -> str:
     """Short zone name for the given instant, e.g. 'EST' or 'EDT'."""
     return slot_datetime(ts, tz).strftime("%Z")
+
+
+def format_slot_date_short(ts: int, tz) -> str:
+    """Compact date for a message headline, e.g. 'Fri Sep 18'."""
+    dt = slot_datetime(ts, tz)
+    return f"{dt.strftime('%a %b')} {dt.day}"
 
 
 # Plain-text labels instead of unicode emoji for the column headers — keeps
@@ -1039,6 +1294,10 @@ def serialize_state() -> dict:
         },
         "guild_seed_mode": {str(k): v for k, v in guild_seed_mode.items()},
         "guild_live_summary": {str(k): bool(v) for k, v in guild_live_summary.items()},
+        "guild_live_channel": {str(k): v for k, v in guild_live_channel.items()},
+        "guild_live_mode": {str(k): v for k, v in guild_live_mode.items()},
+        "guild_live_message": {str(k): v for k, v in guild_live_message.items()},
+        "guild_live_pin": {str(k): bool(v) for k, v in guild_live_pin.items()},
         "rosters": {str(k): v for k, v in rosters.items()},
         "guild_events": {str(k): list(v) for k, v in guild_events.items()},
         "bot_seeded": [[message_id, emoji] for message_id, emoji in bot_seeded],
@@ -1127,6 +1386,22 @@ def load_state() -> None:
     rosters.update({int(k): v for k, v in data.get("rosters", {}).items()})
     guild_live_summary.update(
         {int(k): bool(v) for k, v in data.get("guild_live_summary", {}).items()}
+    )
+    guild_live_channel.update(
+        {int(k): int(v) for k, v in data.get("guild_live_channel", {}).items()}
+    )
+    guild_live_message.update(
+        {int(k): int(v) for k, v in data.get("guild_live_message", {}).items()}
+    )
+    guild_live_pin.update(
+        {int(k): bool(v) for k, v in data.get("guild_live_pin", {}).items()}
+    )
+    guild_live_mode.update(
+        {
+            int(k): v
+            for k, v in data.get("guild_live_mode", {}).items()
+            if v in LIVE_MODES
+        }
     )
     guild_seed_mode.update(
         {
@@ -1442,6 +1717,25 @@ async def render_live_image(event: dict, guild):
     return await asyncio.to_thread(build_grid_image, event, guild, avatars)
 
 
+def live_summary_content(event: dict, channel_id: int) -> str:
+    """The caption above the image.
+
+    Rewritten on every refresh rather than only on the first post, because in
+    "latest" mode one message changes which RSVP it's describing.
+    """
+    # Posted somewhere other than the RSVP itself, the summary has to say where
+    # to actually answer — otherwise it's a scoreboard with no game.
+    elsewhere = (
+        f"  ·  answer in <#{event['channel_id']}>"
+        if channel_id != event["channel_id"]
+        else ""
+    )
+    return (
+        f"**Live summary — {event['title']}**{elsewhere}"
+        "  ·  updates as people answer"
+    )
+
+
 async def refresh_live_summary(event_id: str) -> None:
     event = active_events.get(event_id)
     if event is None or not event.get("live_message_id"):
@@ -1456,22 +1750,49 @@ async def refresh_live_summary(event_id: str) -> None:
     try:
         message = channel.get_partial_message(event["live_message_id"])
         await message.edit(
-            attachments=[discord.File(buffer, filename="rsvp_live.png")]
+            content=live_summary_content(event, channel.id),
+            attachments=[discord.File(buffer, filename="rsvp_live.png")],
         )
     except (discord.HTTPException, discord.NotFound):
         # Someone deleted it, or we lost access. Stop trying to update it.
+        if guild_live_message.get(event["guild_id"]) == event["live_message_id"]:
+            guild_live_message.pop(event["guild_id"], None)
         event["live_message_id"] = None
 
 
-async def start_live_summary(event: dict, channel, guild) -> None:
-    """Post the live summary for an event and pin it."""
+async def start_live_summary(event: dict, fallback_channel, guild) -> None:
+    """Give an event a live summary — a new message, or the shared one."""
     if event.get("live_message_id"):
         return
+
+    guild_id = event["guild_id"]
+    channel = live_summary_channel(guild_id, fallback_channel)
+    if channel is None:
+        return
+
+    if guild_live_mode.get(guild_id, LIVE_EACH) == LIVE_LATEST:
+        shared = guild_live_message.get(guild_id)
+        if shared is not None:
+            # Hand the one pinned message to the newest RSVP, and stop whatever
+            # was using it from writing over the top.
+            for _, other in events_for_guild(guild_id):
+                if other is not event and other.get("live_message_id") == shared:
+                    other["live_message_id"] = None
+
+            event["live_message_id"] = shared
+            event["live_channel_id"] = channel.id
+            await refresh_live_summary(event["id"])
+
+            # refresh clears the id if the message turned out to be gone; only
+            # then do we fall through and post a replacement.
+            if event.get("live_message_id"):
+                return
+            guild_live_message.pop(guild_id, None)
 
     buffer = await render_live_image(event, guild)
     try:
         message = await channel.send(
-            f"**Live summary — {event['title']}**  ·  updates as people answer",
+            live_summary_content(event, channel.id),
             file=discord.File(buffer, filename="rsvp_live.png"),
         )
     except discord.HTTPException:
@@ -1479,11 +1800,14 @@ async def start_live_summary(event: dict, channel, guild) -> None:
 
     event["live_message_id"] = message.id
     event["live_channel_id"] = channel.id
+    if guild_live_mode.get(guild_id, LIVE_EACH) == LIVE_LATEST:
+        guild_live_message[guild_id] = message.id
 
-    try:
-        await message.pin()
-    except discord.HTTPException:
-        pass  # needs Manage Messages, and a channel caps out at 50 pins
+    if wants_pinned_summary(guild_id):
+        try:
+            await message.pin()
+        except discord.HTTPException:
+            pass  # needs Manage Messages, and a channel caps out at 50 pins
 
 
 async def stop_live_summary(event: dict) -> None:
@@ -1492,6 +1816,11 @@ async def stop_live_summary(event: dict) -> None:
     if not message_id:
         return
     event["live_message_id"] = None
+
+    # In "latest" mode the next RSVP should post a fresh one rather than adopt
+    # a message that now says it's finished.
+    if guild_live_message.get(event["guild_id"]) == message_id:
+        guild_live_message.pop(event["guild_id"], None)
 
     channel = bot.get_channel(event.get("live_channel_id") or event["channel_id"])
     if channel is None:
@@ -1525,12 +1854,18 @@ BUTTON_STYLES = {
 
 
 def slot_headline(event: dict, slot: dict) -> str:
-    """Bold server-time headline, with the viewer-localized time trailing it."""
+    """Bold server date and time, with the viewer-localized version trailing it.
+
+    The date is on every slot message rather than expected in the title. It also
+    has to be on the localized half: a 10:00 PM Eastern slot is 3:00 AM the next
+    day in the UK, and a bare time would have quietly said 3:00 AM today.
+    """
     ts = slot["timestamp"]
     tz = event["tz"]
     return (
-        f"**{event['title']} — {format_slot_time(ts, tz)} {format_zone_label(ts, tz)}**"
-        f"  ·  your local time: <t:{ts}:t>"
+        f"**{event['title']} — {format_slot_date_short(ts, tz)}, "
+        f"{format_slot_time(ts, tz)} {format_zone_label(ts, tz)}**"
+        f"  ·  your local time: <t:{ts}:f>"
     )
 
 
@@ -1609,26 +1944,115 @@ async def record_button_vote(
     name="setlivesummary",
     description="Pin a summary image that redraws itself as people answer",
 )
-@app_commands.describe(enabled="Whether new RSVPs get a live summary")
+@app_commands.describe(
+    enabled="Whether new RSVPs get a live summary",
+    channel="Where to post it — leave blank to use whichever channel the RSVP is in",
+    mode="One summary per RSVP, or a single one that follows the newest",
+    pin="Whether to pin it (default: yes)",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="One summary per RSVP", value=LIVE_EACH),
+        app_commands.Choice(
+            name="A single summary that follows the newest RSVP", value=LIVE_LATEST
+        ),
+    ]
+)
 @app_commands.checks.has_permissions(manage_guild=True)
-async def setlivesummary(interaction: discord.Interaction, enabled: bool):
-    guild_live_summary[interaction.guild_id] = enabled
+async def setlivesummary(
+    interaction: discord.Interaction,
+    enabled: bool,
+    channel: discord.TextChannel = None,
+    mode: str = None,
+    pin: bool = None,
+):
+    # Check up front rather than letting the post fail quietly in the
+    # background, where nobody would ever see the error.
+    if enabled and channel is not None:
+        allowed = channel.permissions_for(interaction.guild.me)
+        missing = [
+            name
+            for name, granted in (
+                ("View Channel", allowed.view_channel),
+                ("Send Messages", allowed.send_messages),
+                ("Attach Files", allowed.attach_files),
+            )
+            if not granted
+        ]
+        if missing:
+            await interaction.response.send_message(
+                f"I can't post live summaries in {channel.mention} — I'm missing "
+                f"**{'**, **'.join(missing)}** there.",
+                ephemeral=True,
+            )
+            return
+
+    guild_id = interaction.guild_id
+    guild_live_summary[guild_id] = enabled
+    if channel is not None:
+        guild_live_channel[guild_id] = channel.id
+
+    chosen_mode = getattr(mode, "value", mode)
+    if chosen_mode in LIVE_MODES:
+        # Switching away from "latest" releases the shared message, so the next
+        # RSVP posts its own instead of taking that one over.
+        if chosen_mode != guild_live_mode.get(guild_id, LIVE_EACH):
+            guild_live_message.pop(guild_id, None)
+        guild_live_mode[guild_id] = chosen_mode
+    if pin is not None:
+        guild_live_pin[guild_id] = pin
+
     save_state_soon()
-    running = events_for_guild(interaction.guild_id)
+    running = events_for_guild(guild_id)
 
     if enabled:
+        configured = guild_live_channel.get(guild_id)
+        where = (
+            f"in <#{configured}>"
+            if configured
+            else "in whichever channel the RSVP is created in"
+        )
+
+        if guild_live_mode.get(guild_id, LIVE_EACH) == LIVE_LATEST:
+            mode_note = (
+                "• One summary, reused: each new RSVP takes over the same "
+                "message, so there's always exactly one and it's always the "
+                "newest. Older ones stop updating it."
+            )
+        else:
+            mode_note = "• Each RSVP gets its own summary."
+
+        if not wants_pinned_summary(guild_id):
+            pin_note = "• It won't be pinned."
+        else:
+            pin_note = (
+                "• Pinning needs Manage Messages; without it the summary still "
+                "works, it just won't be pinned."
+            )
+            target = bot.get_channel(configured) if configured else None
+            if target is not None and not target.permissions_for(
+                interaction.guild.me
+            ).manage_messages:
+                pin_note = (
+                    f"• I can't pin in <#{configured}> (no Manage Messages), so "
+                    "the summary will post but stay unpinned."
+                )
+
         await interaction.response.send_message(
-            "New RSVPs will get a pinned summary image that redraws itself as "
+            f"New RSVPs will get a summary image {where} that redraws itself as "
             "people answer.\n"
+            f"{mode_note}\n"
             f"• It redraws at most once every {LIVE_REFRESH_DELAY:.0f} seconds. "
             "Replacing an image means re-uploading it, so a burst of answers "
             "becomes one redraw rather than twenty.\n"
             "• It uses the compact grid layout — `/summary` still gives you the "
             "detailed one.\n"
-            "• Pinning needs Manage Messages; without it the summary still "
-            "works, it just won't be pinned."
-            + (f"\n\nStarting one for the {len(running)} already running."
-               if running else ""),
+            f"{pin_note}"
+            + (
+                f"\n\nStarting one for the {len(running)} already running."
+                if running
+                else ""
+            ),
             ephemeral=True,
         )
         for _, event in running:
@@ -1645,6 +2069,68 @@ async def setlivesummary(interaction: discord.Interaction, enabled: bool):
         )
         for _, event in running:
             run_in_background(stop_live_summary(event))
+
+
+@bot.tree.command(
+    name="closersvp",
+    description="Stop tracking an RSVP, freeing up one of the slots",
+)
+@app_commands.describe(
+    title="Which RSVP to close",
+    delete_messages="Also delete its messages from the channel (off by default)",
+)
+@app_commands.autocomplete(title=rsvp_title_autocomplete)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def closersvp(
+    interaction: discord.Interaction, title: str, delete_messages: bool = False
+):
+    found, problem = resolve_event(interaction.guild_id, title)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    event_id, event = found
+
+    await interaction.response.defer(ephemeral=True)
+    await stop_live_summary(event)
+
+    channel = bot.get_channel(event["channel_id"])
+    touched = 0
+    if channel is not None:
+        for slot in event["slots"].values():
+            message = channel.get_partial_message(slot["message_id"])
+            try:
+                if delete_messages:
+                    await message.delete()
+                else:
+                    # Leave the result visible, but make it obvious that
+                    # reacting to it now does nothing.
+                    base = (
+                        button_message_text(event, slot)
+                        if event["mode"] == BUTTON_MODE
+                        else slot_headline(event, slot)
+                    )
+                    await message.edit(
+                        content=f"{base}\n**Closed** — no longer counting answers.",
+                        view=None,
+                    )
+            except (discord.HTTPException, discord.NotFound):
+                continue
+            touched += 1
+
+    close_event(interaction.guild_id, event_id)
+    save_state_soon()
+
+    remaining = len(events_for_guild(interaction.guild_id))
+    outcome = (
+        f"deleted {touched} message{'' if touched == 1 else 's'}"
+        if delete_messages
+        else f"marked {touched} message{'' if touched == 1 else 's'} as closed"
+    )
+    await interaction.followup.send(
+        f"Closed **{event['title']}** and {outcome}.\n"
+        f"{remaining} of {MAX_ACTIVE_RSVPS} RSVPs still running.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="rsvps", description="List the RSVPs running on this server")
@@ -1704,22 +2190,27 @@ async def rsvps(interaction: discord.Interaction):
 @bot.tree.command(name="rsvp", description="Create an RSVP — one message per time slot")
 @app_commands.describe(
     title="What are people RSVPing to?",
-    date="Optional date as YYYY-MM-DD (defaults to today, in the server's set timezone)",
+    date="When — today, tomorrow, friday, in 3 days, 9/12, sep 12, 2026-09-12 (default: today)",
 )
 async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
     tz = get_timezone(interaction.guild_id)
+    today = datetime.now(tz).date()
 
     if date is None:
-        date_str = datetime.now(tz).strftime("%Y-%m-%d")
+        target = today
     else:
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
+        target = parse_date(date, today)
+        if target is None:
             await interaction.response.send_message(
-                "Date must be in YYYY-MM-DD format.", ephemeral=True
+                f"Couldn't read `{date}` as a date. Any of these work:\n"
+                "`today` · `tomorrow` · `friday` · `next friday` · `in 3 days`\n"
+                "`9/12` · `9/12/26` · `sep 12` · `12 sept` · `2026-09-12`",
+                ephemeral=True,
             )
             return
-        date_str = date
+
+    date_str = target.strftime("%Y-%m-%d")
+    readable_date = f"{target.strftime('%A, %B')} {target.day}"
 
     time_slots = get_time_slots(interaction.guild_id)
 
@@ -1735,7 +2226,12 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
             return
 
     try:
-        await interaction.response.send_message(f"Creating RSVP for **{title}**...", ephemeral=True)
+        # The resolved date is echoed back because the parser accepts loose
+        # input — "9/12" read the wrong way round should be visible, not silent.
+        await interaction.response.send_message(
+            f"Creating RSVP for **{title}** on **{readable_date}**...",
+            ephemeral=True,
+        )
 
         event_id = str(uuid.uuid4())
         slots = {}
@@ -1849,92 +2345,6 @@ def locate_slot(message_id: int):
     if slot is None:
         return None
     return event, slot
-
-
-def events_for_guild(guild_id: int) -> list:
-    """This guild's live RSVPs as (event_id, event), oldest first."""
-    return [
-        (event_id, active_events[event_id])
-        for event_id in guild_events.get(guild_id, [])
-        if event_id in active_events
-    ]
-
-
-def forget_event(event_id: str):
-    """Stop tracking an RSVP and drop every trace of its messages."""
-    event = active_events.pop(event_id, None)
-    if event is None:
-        return None
-
-    pending = _live_refresh.pop(event_id, None)
-    if pending is not None and not pending.done():
-        pending.cancel()
-
-    for slot in event["slots"].values():
-        message_id = slot["message_id"]
-        message_index.pop(message_id, None)
-        _order_locks.pop(message_id, None)
-        for emoji in STATUS_ORDER:
-            bot_seeded.discard((message_id, emoji))
-    return event
-
-
-def register_event(guild_id: int, event_id: str) -> list:
-    """Track a new RSVP, closing the oldest if that puts the guild over the cap.
-
-    Returns the events that were closed. This is also what keeps message_index
-    and bot_seeded from growing forever in a long-running process.
-    """
-    event_ids = guild_events.setdefault(guild_id, [])
-    event_ids.append(event_id)
-
-    closed = []
-    while len(event_ids) > MAX_ACTIVE_RSVPS:
-        evicted = forget_event(event_ids.pop(0))
-        if evicted is not None:
-            closed.append(evicted)
-    return closed
-
-
-def resolve_event(guild_id: int, title):
-    """Pick the RSVP a command means. Returns ((event_id, event), None) or
-    (None, message) explaining what to do instead."""
-    live = events_for_guild(guild_id)
-    if not live:
-        return None, "No RSVP found. Run `/rsvp` first."
-
-    listing = ", ".join(f"`{event['title']}`" for _, event in live)
-
-    if title is None:
-        if len(live) == 1:
-            return live[0], None
-        return None, (
-            f"There are {len(live)} RSVPs running — say which one you mean: {listing}"
-        )
-
-    needle = title.strip().casefold()
-    exact = [pair for pair in live if pair[1]["title"].casefold() == needle]
-    if len(exact) == 1:
-        return exact[0], None
-
-    partial = [pair for pair in live if needle in pair[1]["title"].casefold()]
-    if len(partial) == 1:
-        return partial[0], None
-    if len(partial) > 1:
-        matches = ", ".join(f"`{event['title']}`" for _, event in partial)
-        return None, f"`{title}` matches more than one RSVP: {matches}"
-
-    return None, f"No RSVP called `{title}`. Running now: {listing}"
-
-
-async def rsvp_title_autocomplete(interaction: discord.Interaction, current: str):
-    """Offer the guild's live RSVP titles as you type."""
-    needle = (current or "").casefold()
-    return [
-        app_commands.Choice(name=event["title"][:100], value=event["title"][:100])
-        for _, event in events_for_guild(interaction.guild_id)
-        if needle in event["title"].casefold()
-    ][:25]
 
 
 # Re-laying the options is a remove-then-add sequence, and Discord rate limits
