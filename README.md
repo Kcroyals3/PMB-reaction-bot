@@ -36,6 +36,18 @@ Customize the time slots used by /rsvp. Comma-separated, written however you lik
 
 Replaces the default slots (20:00, 20:30, 21:00, 21:30, 22:00, 22:30, 23:00 — i.e. 8:00 PM through 11:00 PM) for this server. Requires Manage Server permission.
 
+/settimestamp <style>
+
+Chooses how each reader's own local time appears on RSVP messages. Requires Manage Server permission.
+
+  Date and time (default) — 18 September 2026 17:00
+  Time only               — 17:00
+  Full                    — Friday, 18 September 2026 17:00
+  Relative                — in 3 hours
+  Off                     — server time only
+
+The command replies with a live preview rendered in your own timezone, so you see the actual result rather than a description of it. Turning it off means nothing on the message adapts per reader — anyone outside the server's timezone has to convert it themselves.
+
 /settimezone <zone>
 
 Sets the timezone used to interpret the times given in /settimes and /rsvp. Defaults to America/New_York (US Eastern), so most servers never need to run this.
@@ -78,6 +90,8 @@ title picks which RSVP when more than one is running — it autocompletes, and m
 
 Because it's an image rather than Discord markdown, it cannot localize per viewer the way /rsvp messages do — so it states its timezone in the header ("all times EDT"). Everyone sees the server's timezone.
 
+Titles may contain your server's own emoji. They're downloaded and drawn inline at the right size, rather than appearing as the raw <:name:id> text Discord stores them as. Unicode emoji work too. Either kind is skipped rather than drawn as a broken box if it can't be fetched or rendered.
+
 /rsvps
 
 Lists what's running on this server: each title, its date, how many slots and how many people have answered, which voting mode it uses, whether it has a live summary pinned, and the best turnout so far. Use a title from here with /summary or /reactping.
@@ -90,13 +104,15 @@ channel — where to post it. Leave blank and each summary appears in whichever 
 
 mode — "One summary per RSVP" (default), or "A single summary that follows the newest RSVP". The second suits a dedicated summary channel: each new RSVP takes over the same message, so there's always exactly one and it's always current. Older RSVPs stop writing to it.
 
-pin — whether to pin it. On by default. Pinning needs Manage Messages; if the bot doesn't have it the summary still posts, just unpinned, and the command tells you so up front.
+pin — whether to pin it. Off by default, since pinning needs Manage Messages (which the bot often doesn't have) and a channel only holds 50 pins. Pass pin: True to turn it on; if the permission is missing the summary still posts, just unpinned, and the command tells you so up front.
 
 It uses the compact grid layout (people down the side, slots across the top) rather than the detailed card layout, because a live image lives in the channel permanently — the grid says the same thing in about a quarter of the height.
 
 It redraws at most once every 4 seconds. Replacing a message's image means re-uploading it, so a burst of twenty answers becomes one redraw rather than twenty.
 
-Turning it off leaves the image in place, marks it as no longer updating, and unpins it.
+cleanup — whether posting a new summary deletes the previous one, so the channel holds one instead of a growing pile. Off by default, since a deleted message can't be brought back. The new summary is posted first and the old one removed after, so the channel is never briefly left without one. Note that older RSVPs still running lose their live summary this way — /summary still works for them. In "follows the newest" mode this setting does nothing, because there's only ever one message to begin with.
+
+Turning the whole thing off leaves the image in place, marks it as no longer updating, and unpins it — unless cleanup is on, in which case it's deleted.
 
 /closersvp <title> [delete_messages]
 

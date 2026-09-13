@@ -144,7 +144,47 @@ guild_live_pin = {}
 
 
 def wants_pinned_summary(guild_id) -> bool:
-    return bool(guild_live_pin.get(guild_id, True))
+    # Off by default: pinning needs a permission the bot often doesn't have,
+    # and a channel only holds 50 pins, so opting in is the safer default.
+    return bool(guild_live_pin.get(guild_id, False))
+
+
+# guild_id -> bool. Whether posting a new live summary deletes the previous
+# one, so the channel holds one rather than a growing pile. Off by default,
+# because deleting a message can't be undone.
+guild_live_cleanup = {}
+
+
+def wants_summary_cleanup(guild_id) -> bool:
+    return bool(guild_live_cleanup.get(guild_id, False))
+
+
+# How the viewer-localized half of a slot message reads. The keys are Discord's
+# own timestamp style letters, except "off" which drops that half entirely.
+TIMESTAMP_STYLES = {
+    "f": "your local time: {stamp}",
+    "t": "your local time: {stamp}",
+    "F": "your local time: {stamp}",
+    "R": "{stamp}",
+    "off": None,
+}
+DEFAULT_TIMESTAMP_STYLE = "f"
+
+# guild_id -> one of the keys above
+guild_timestamp_style = {}
+
+
+def timestamp_style(guild_id) -> str:
+    return guild_timestamp_style.get(guild_id, DEFAULT_TIMESTAMP_STYLE)
+
+
+def format_local_timestamp(ts: int, guild_id) -> str:
+    """The trailing, per-viewer half of a slot message. Empty when turned off."""
+    style = timestamp_style(guild_id)
+    template = TIMESTAMP_STYLES.get(style)
+    if template is None:
+        return ""
+    return "  ·  " + template.format(stamp=f"<t:{ts}:{style}>")
 
 
 def events_for_guild(guild_id: int) -> list:
@@ -633,13 +673,82 @@ EMOJI_RUN = re.compile(
 )
 
 
-def draw_rich_text(img, draw, xy, text, font, fill, px):
+# A server's own emoji, as Discord writes them in message text: <:name:id>,
+# or <a:name:id> when animated. Left alone these would be drawn literally, so
+# a title like "Scrims <:pmb:123>" rendered the id and all.
+CUSTOM_EMOJI = re.compile(r"<(a?):([A-Za-z0-9_]{2,32}):(\d{15,25})>")
+
+# emoji id -> image bytes. Content-addressed by id, so it never goes stale.
+_custom_emoji_cache = {}
+
+
+async def fetch_custom_emojis(*texts) -> dict:
+    """Download any server emoji used in these strings, once each."""
+    images = {}
+    for text in texts:
+        for match in CUSTOM_EMOJI.finditer(text or ""):
+            emoji_id = int(match.group(3))
+            if emoji_id in images:
+                continue
+            if emoji_id in _custom_emoji_cache:
+                images[emoji_id] = _custom_emoji_cache[emoji_id]
+                continue
+
+            partial = discord.PartialEmoji(
+                name=match.group(2), id=emoji_id, animated=bool(match.group(1))
+            )
+            try:
+                data = await partial.read()
+            except (discord.HTTPException, discord.NotFound):
+                continue  # deleted, or from a server the bot can't see
+
+            _custom_emoji_cache[emoji_id] = data
+            images[emoji_id] = data
+    return images
+
+
+def draw_custom_emoji(img, x, y, emoji_id, images, px):
+    """Paste a server emoji inline, scaled to the surrounding text."""
+    raw = images.get(emoji_id)
+    if not raw:
+        return x  # unavailable — skip it, same as an unrenderable unicode emoji
+    try:
+        glyph = Image.open(io.BytesIO(raw)).convert("RGBA")
+    except OSError:
+        return x
+
+    ratio = px / glyph.height
+    glyph = glyph.resize(
+        (max(1, int(glyph.width * ratio)), max(1, int(glyph.height * ratio))),
+        Image.LANCZOS,
+    )
+    img.paste(glyph, (int(x), int(y)), glyph)
+    return x + glyph.width + max(1, px // 10)
+
+
+def draw_rich_text(img, draw, xy, text, font, fill, px, emojis=None):
+    """Draw text containing unicode emoji and/or this server's own emoji."""
+    x, y = xy
+    position = 0
+    for match in CUSTOM_EMOJI.finditer(text):
+        if match.start() > position:
+            x = draw_unicode_text(
+                img, draw, x, y, text[position : match.start()], font, fill, px
+            )
+        x = draw_custom_emoji(img, x, y, int(match.group(3)), emojis or {}, px)
+        position = match.end()
+
+    if position < len(text):
+        x = draw_unicode_text(img, draw, x, y, text[position:], font, fill, px)
+    return x
+
+
+def draw_unicode_text(img, draw, x, y, text, font, fill, px):
     """Draw `text`, rendering any emoji runs with the color emoji font.
 
     Falls back to skipping emoji entirely when no emoji font is installed,
     which looks far better than a row of tofu boxes.
     """
-    x, y = xy
     for part in EMOJI_RUN.split(text):
         if not part:
             continue
@@ -840,7 +949,7 @@ GRID_MAX_ROWS = 25
 
 
 def build_grid_image(
-    event: dict, guild: discord.Guild, avatars: dict = None
+    event: dict, guild: discord.Guild, avatars: dict = None, emojis: dict = None
 ) -> io.BytesIO:
     """A compact who-by-when matrix: people down the side, slots across the top.
 
@@ -901,7 +1010,9 @@ def build_grid_image(
     img = Image.new("RGB", (WIDTH, height), PAGE_BG)
     draw = ImageDraw.Draw(img)
 
-    draw_rich_text(img, draw, (PAD, PAD), event["title"], title_font, TEXT, _s(26))
+    draw_rich_text(
+        img, draw, (PAD, PAD), event["title"], title_font, TEXT, _s(26), emojis
+    )
 
     first_ts = slots[0]["timestamp"]
     person_word = "person" if len(names) == 1 else "people"
@@ -1042,7 +1153,7 @@ def build_grid_image(
 
 
 def build_summary_image(
-    event: dict, guild: discord.Guild, avatars: dict = None
+    event: dict, guild: discord.Guild, avatars: dict = None, emojis: dict = None
 ) -> io.BytesIO:
     avatars = avatars or {}
     title_font = load_font(_s(30), bold=True)
@@ -1141,7 +1252,9 @@ def build_summary_image(
     img = Image.new("RGB", (WIDTH, height), PAGE_BG)
     draw = ImageDraw.Draw(img)
 
-    draw_rich_text(img, draw, (PAD, PAD), event["title"], title_font, TEXT, _s(30))
+    draw_rich_text(
+        img, draw, (PAD, PAD), event["title"], title_font, TEXT, _s(30), emojis
+    )
 
     first_ts = next(iter(event["slots"].values()))["timestamp"]
     slot_word = "slot" if len(cards) == 1 else "slots"
@@ -1298,6 +1411,10 @@ def serialize_state() -> dict:
         "guild_live_mode": {str(k): v for k, v in guild_live_mode.items()},
         "guild_live_message": {str(k): v for k, v in guild_live_message.items()},
         "guild_live_pin": {str(k): bool(v) for k, v in guild_live_pin.items()},
+        "guild_live_cleanup": {str(k): bool(v) for k, v in guild_live_cleanup.items()},
+        "guild_timestamp_style": {
+            str(k): v for k, v in guild_timestamp_style.items()
+        },
         "rosters": {str(k): v for k, v in rosters.items()},
         "guild_events": {str(k): list(v) for k, v in guild_events.items()},
         "bot_seeded": [[message_id, emoji] for message_id, emoji in bot_seeded],
@@ -1395,6 +1512,16 @@ def load_state() -> None:
     )
     guild_live_pin.update(
         {int(k): bool(v) for k, v in data.get("guild_live_pin", {}).items()}
+    )
+    guild_live_cleanup.update(
+        {int(k): bool(v) for k, v in data.get("guild_live_cleanup", {}).items()}
+    )
+    guild_timestamp_style.update(
+        {
+            int(k): v
+            for k, v in data.get("guild_timestamp_style", {}).items()
+            if v in TIMESTAMP_STYLES
+        }
     )
     guild_live_mode.update(
         {
@@ -1606,6 +1733,54 @@ MODE_EXPLANATIONS = {
 
 
 @bot.tree.command(
+    name="settimestamp",
+    description="Choose how each reader's own local time appears on RSVP messages",
+)
+@app_commands.describe(style="How the localized half of a slot message reads")
+@app_commands.choices(
+    style=[
+        app_commands.Choice(name="Date and time (default)", value="f"),
+        app_commands.Choice(name="Time only", value="t"),
+        app_commands.Choice(name="Full — weekday, date and time", value="F"),
+        app_commands.Choice(name="Relative — “in 3 hours”", value="R"),
+        app_commands.Choice(name="Off — show the server's time only", value="off"),
+    ]
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def settimestamp(interaction: discord.Interaction, style: str):
+    value = getattr(style, "value", style)
+    if value not in TIMESTAMP_STYLES:
+        await interaction.response.send_message(
+            "Pick one of the offered options.", ephemeral=True
+        )
+        return
+
+    guild_timestamp_style[interaction.guild_id] = value
+    save_state_soon()
+
+    # Rendered as a real timestamp so the preview is what they'll actually see,
+    # in their own timezone, rather than a description of it.
+    tz = get_timezone(interaction.guild_id)
+    sample = int(datetime.now(timezone.utc).timestamp()) + 3600
+    example = (
+        f"**Movie Night — {format_slot_date_short(sample, tz)}, "
+        f"{format_slot_time(sample, tz)} {format_zone_label(sample, tz)}**"
+        f"{format_local_timestamp(sample, interaction.guild_id)}"
+    )
+
+    caveat = (
+        "\n\nNothing on the message will adapt to a reader's timezone now — "
+        "anyone outside the server's zone has to convert it themselves."
+        if value == "off"
+        else ""
+    )
+    await interaction.response.send_message(
+        f"New RSVP messages will look like this:\n\n{example}{caveat}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="setvoting",
     description="Choose how people answer an RSVP: reactions or buttons",
 )
@@ -1713,8 +1888,11 @@ async def render_live_image(event: dict, guild):
         for voters in slot["votes"].values()
         for uid in voters
     }
-    avatars = await fetch_avatars(guild, voter_ids)
-    return await asyncio.to_thread(build_grid_image, event, guild, avatars)
+    avatars, emojis = await asyncio.gather(
+        fetch_avatars(guild, voter_ids),
+        fetch_custom_emojis(event["title"]),
+    )
+    return await asyncio.to_thread(build_grid_image, event, guild, avatars, emojis)
 
 
 def live_summary_content(event: dict, channel_id: int) -> str:
@@ -1803,6 +1981,13 @@ async def start_live_summary(event: dict, fallback_channel, guild) -> None:
     if guild_live_mode.get(guild_id, LIVE_EACH) == LIVE_LATEST:
         guild_live_message[guild_id] = message.id
 
+    # Clear out the older ones only once the replacement is up, so the channel
+    # is never briefly left without a summary.
+    if wants_summary_cleanup(guild_id):
+        for _, older in events_for_guild(guild_id):
+            if older is not event and older.get("live_message_id"):
+                run_in_background(remove_live_summary(older))
+
     if wants_pinned_summary(guild_id):
         try:
             await message.pin()
@@ -1810,8 +1995,30 @@ async def start_live_summary(event: dict, fallback_channel, guild) -> None:
             pass  # needs Manage Messages, and a channel caps out at 50 pins
 
 
+async def remove_live_summary(event: dict) -> None:
+    """Delete an event's live summary outright."""
+    message_id = event.get("live_message_id")
+    if not message_id:
+        return
+    event["live_message_id"] = None
+    if guild_live_message.get(event["guild_id"]) == message_id:
+        guild_live_message.pop(event["guild_id"], None)
+
+    channel = bot.get_channel(event.get("live_channel_id") or event["channel_id"])
+    if channel is None:
+        return
+    try:
+        await channel.get_partial_message(message_id).delete()
+    except (discord.HTTPException, discord.NotFound):
+        pass
+
+
 async def stop_live_summary(event: dict) -> None:
     """Leave the image in place but mark it as no longer live, and unpin it."""
+    if wants_summary_cleanup(event["guild_id"]):
+        await remove_live_summary(event)
+        return
+
     message_id = event.get("live_message_id")
     if not message_id:
         return
@@ -1865,7 +2072,7 @@ def slot_headline(event: dict, slot: dict) -> str:
     return (
         f"**{event['title']} — {format_slot_date_short(ts, tz)}, "
         f"{format_slot_time(ts, tz)} {format_zone_label(ts, tz)}**"
-        f"  ·  your local time: <t:{ts}:f>"
+        f"{format_local_timestamp(ts, event['guild_id'])}"
     )
 
 
@@ -1942,13 +2149,14 @@ async def record_button_vote(
 
 @bot.tree.command(
     name="setlivesummary",
-    description="Pin a summary image that redraws itself as people answer",
+    description="Post a summary image that redraws itself as people answer",
 )
 @app_commands.describe(
     enabled="Whether new RSVPs get a live summary",
     channel="Where to post it — leave blank to use whichever channel the RSVP is in",
     mode="One summary per RSVP, or a single one that follows the newest",
-    pin="Whether to pin it (default: yes)",
+    pin="Whether to pin it (default: no)",
+    cleanup="Delete the previous summary when a new one is posted (default: no)",
 )
 @app_commands.choices(
     mode=[
@@ -1965,6 +2173,7 @@ async def setlivesummary(
     channel: discord.TextChannel = None,
     mode: str = None,
     pin: bool = None,
+    cleanup: bool = None,
 ):
     # Check up front rather than letting the post fail quietly in the
     # background, where nobody would ever see the error.
@@ -2001,6 +2210,8 @@ async def setlivesummary(
         guild_live_mode[guild_id] = chosen_mode
     if pin is not None:
         guild_live_pin[guild_id] = pin
+    if cleanup is not None:
+        guild_live_cleanup[guild_id] = cleanup
 
     save_state_soon()
     running = events_for_guild(guild_id)
@@ -2019,11 +2230,17 @@ async def setlivesummary(
                 "message, so there's always exactly one and it's always the "
                 "newest. Older ones stop updating it."
             )
+        elif wants_summary_cleanup(guild_id):
+            mode_note = (
+                "• Each RSVP gets its own summary, and posting a new one "
+                "**deletes** the previous. Older RSVPs that are still running "
+                "lose their live summary — `/summary` still works for them."
+            )
         else:
             mode_note = "• Each RSVP gets its own summary."
 
         if not wants_pinned_summary(guild_id):
-            pin_note = "• It won't be pinned."
+            pin_note = "• It won't be pinned — run this again with `pin: True` if you want that."
         else:
             pin_note = (
                 "• Pinning needs Manage Messages; without it the summary still "
@@ -2780,9 +2997,10 @@ async def summary(interaction: discord.Interaction, title: str = None):
     #
     # Warm avatars for everyone already known while that read is in flight —
     # both are network-bound and neither depends on the other.
-    await asyncio.gather(
+    _reconciled, _warmed, emojis = await asyncio.gather(
         reconcile_event(event, channel, repair=False),
         fetch_avatars(interaction.guild, current_voters()),
+        fetch_custom_emojis(event["title"]),
     )
     read_ms = since_start()
 
@@ -2793,7 +3011,7 @@ async def summary(interaction: discord.Interaction, title: str = None):
     # Compositing a few dozen avatars is CPU-bound; keep it off the event loop
     # so the bot stays responsive while the image is built.
     buffer = await asyncio.to_thread(
-        build_summary_image, event, interaction.guild, avatars
+        build_summary_image, event, interaction.guild, avatars, emojis
     )
     render_ms = since_start() - read_ms - avatar_ms
 
