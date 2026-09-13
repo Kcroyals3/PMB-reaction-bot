@@ -327,6 +327,123 @@ def parse_time(value: str):
     return hour, minute
 
 
+WEEKDAY_NAMES = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1, "tuesday's": 1,
+    "wednesday": 2, "wed": 2, "weds": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+MONTH_NAMES = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+
+def _build_date(year, month, day, today):
+    """Assemble a date, rolling a yearless one forward if it's already gone.
+
+    Someone typing "1/5" in December means next January, not ten months ago.
+    """
+    try:
+        if year is not None:
+            return datetime(year, month, day).date()
+        candidate = datetime(today.year, month, day).date()
+        if candidate < today:
+            candidate = datetime(today.year + 1, month, day).date()
+        return candidate
+    except ValueError:
+        return None  # 31 February, and friends
+
+
+def parse_date(value: str, today):
+    """Read a date the way people write one, or None if it can't be read.
+
+    Handles "today", "tomorrow", "friday", "next friday", "in 3 days",
+    "2026-09-12", "9/12", "9/12/26", "sep 12", "12 sept", "September 12 2026".
+
+    Slash dates are read US-style (month first), since that's what this bot's
+    default timezone implies — except when the first number can't be a month,
+    which makes "13/5" unambiguous. /rsvp echoes back the date it settled on,
+    so a misread is visible rather than silent.
+    """
+    text = re.sub(r"\s+", " ", value.strip().lower().replace(",", " ")).strip()
+    if not text:
+        return None
+
+    if text in ("today", "tonight", "tonite", "now"):
+        return today
+    if text in ("tomorrow", "tmr", "tmrw", "tom", "tomorow"):
+        return today + timedelta(days=1)
+    if text in ("day after tomorrow", "overmorrow"):
+        return today + timedelta(days=2)
+
+    match = re.fullmatch(r"(?:in )?\+?(\d{1,3})(?: ?d| ?days?)?", text)
+    if match and (text.startswith("in ") or text.startswith("+") or text[-1] in "sd"):
+        return today + timedelta(days=int(match.group(1)))
+
+    match = re.fullmatch(r"(next|this|coming)? ?([a-z']+)", text)
+    if match and match.group(2) in WEEKDAY_NAMES:
+        ahead = (WEEKDAY_NAMES[match.group(2)] - today.weekday()) % 7
+        if match.group(1) == "next":
+            # "next friday" means the one after this week's, even mid-week.
+            ahead += 7 if ahead else 7
+        return today + timedelta(days=ahead)
+
+    match = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if match:
+        return _build_date(
+            int(match.group(1)), int(match.group(2)), int(match.group(3)), today
+        )
+
+    match = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{2,4}))?", text)
+    if match:
+        first, second = int(match.group(1)), int(match.group(2))
+        month, day = first, second
+        if first > 12 >= second:
+            month, day = second, first  # can only be day-first
+        year = match.group(3)
+        if year is not None:
+            year = int(year)
+            if year < 100:
+                year += 2000
+        return _build_date(year, month, day, today)
+
+    month = day = year = None
+    for token in text.replace(" of ", " ").split(" "):
+        token = token.strip(".")
+        if token in MONTH_NAMES:
+            month = MONTH_NAMES[token]
+            continue
+        digits = re.sub(r"(st|nd|rd|th)$", "", token)
+        if not digits.isdigit():
+            return None
+        number = int(digits)
+        if number >= 1000 or (day is not None and year is None):
+            year = number
+        elif day is None:
+            day = number
+        else:
+            return None
+
+    if month is None or day is None:
+        return None
+    return _build_date(year, month, day, today)
+
+
 def format_label(label: str) -> str:
     """Render a stored 'HH:MM' slot label the way people read times."""
     parsed = parse_time(label)
@@ -2061,22 +2178,27 @@ async def rsvps(interaction: discord.Interaction):
 @bot.tree.command(name="rsvp", description="Create an RSVP — one message per time slot")
 @app_commands.describe(
     title="What are people RSVPing to?",
-    date="Optional date as YYYY-MM-DD (defaults to today, in the server's set timezone)",
+    date="When — today, tomorrow, friday, in 3 days, 9/12, sep 12, 2026-09-12 (default: today)",
 )
 async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
     tz = get_timezone(interaction.guild_id)
+    today = datetime.now(tz).date()
 
     if date is None:
-        date_str = datetime.now(tz).strftime("%Y-%m-%d")
+        target = today
     else:
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
+        target = parse_date(date, today)
+        if target is None:
             await interaction.response.send_message(
-                "Date must be in YYYY-MM-DD format.", ephemeral=True
+                f"Couldn't read `{date}` as a date. Any of these work:\n"
+                "`today` · `tomorrow` · `friday` · `next friday` · `in 3 days`\n"
+                "`9/12` · `9/12/26` · `sep 12` · `12 sept` · `2026-09-12`",
+                ephemeral=True,
             )
             return
-        date_str = date
+
+    date_str = target.strftime("%Y-%m-%d")
+    readable_date = f"{target.strftime('%A, %B')} {target.day}"
 
     time_slots = get_time_slots(interaction.guild_id)
 
@@ -2092,7 +2214,12 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
             return
 
     try:
-        await interaction.response.send_message(f"Creating RSVP for **{title}**...", ephemeral=True)
+        # The resolved date is echoed back because the parser accepts loose
+        # input — "9/12" read the wrong way round should be visible, not silent.
+        await interaction.response.send_message(
+            f"Creating RSVP for **{title}** on **{readable_date}**...",
+            ephemeral=True,
+        )
 
         event_id = str(uuid.uuid4())
         slots = {}

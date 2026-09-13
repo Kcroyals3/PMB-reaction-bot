@@ -12,7 +12,15 @@ Posts one message per time slot, formatted as:
 The server's timezone leads, so everyone sees the same time when comparing slots or quoting one back to each other. The trailing time is a Discord timestamp (<t:...:t>), which Discord renders in each reader's own timezone.
 
 title — what people are RSVPing to (e.g. "Movie Night")
-date (optional) — YYYY-MM-DD, defaults to today
+date (optional) — defaults to today. Written however you like:
+
+  today, tonight, tomorrow, tmr
+  friday, fri, next friday
+  in 3 days, +5, 10 days
+  9/12, 9-12, 9/12/26, 2026-09-12
+  sep 12, september 12th, 12 sept, Dec 25 2027
+
+A date with no year rolls forward — typing 1/5 in December means next January, not ten months ago. Slash dates are read US-style (month first), except where the first number can't be a month, which makes 18/9 unambiguous. /rsvp echoes back the date it settled on, so a misread is visible rather than silent.
 
 Each message gets ✅ (yes), ❌ (no), and ❓ (maybe) reactions — or three buttons instead, depending on /setvoting.
 
