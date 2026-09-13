@@ -36,6 +36,18 @@ Customize the time slots used by /rsvp. Comma-separated, written however you lik
 
 Replaces the default slots (20:00, 20:30, 21:00, 21:30, 22:00, 22:30, 23:00 — i.e. 8:00 PM through 11:00 PM) for this server. Requires Manage Server permission.
 
+/settimestamp <style>
+
+Chooses how each reader's own local time appears on RSVP messages. Requires Manage Server permission.
+
+  Date and time (default) — 18 September 2026 17:00
+  Time only               — 17:00
+  Full                    — Friday, 18 September 2026 17:00
+  Relative                — in 3 hours
+  Off                     — server time only
+
+The command replies with a live preview rendered in your own timezone, so you see the actual result rather than a description of it. Turning it off means nothing on the message adapts per reader — anyone outside the server's timezone has to convert it themselves.
+
 /settimezone <zone>
 
 Sets the timezone used to interpret the times given in /settimes and /rsvp. Defaults to America/New_York (US Eastern), so most servers never need to run this.
@@ -77,6 +89,8 @@ Renders a shareable PNG of every time slot with each responder's avatar and name
 title picks which RSVP when more than one is running — it autocompletes, and matches case-insensitively on a partial name. Leave it blank when only one is running.
 
 Because it's an image rather than Discord markdown, it cannot localize per viewer the way /rsvp messages do — so it states its timezone in the header ("all times EDT"). Everyone sees the server's timezone.
+
+Titles may contain your server's own emoji. They're downloaded and drawn inline at the right size, rather than appearing as the raw <:name:id> text Discord stores them as. Unicode emoji work too. Either kind is skipped rather than drawn as a broken box if it can't be fetched or rendered.
 
 /rsvps
 
