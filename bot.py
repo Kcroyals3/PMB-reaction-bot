@@ -683,24 +683,50 @@ _custom_emoji_cache = {}
 
 
 async def fetch_custom_emojis(*texts) -> dict:
-    """Download any server emoji used in these strings, once each."""
+    """Download any server emoji used in these strings, once each.
+
+    Never raises. This only decorates a title, so a problem here must not stop
+    the image being drawn — let alone the RSVP being created.
+
+    Emoji are looked up through the bot's own cache rather than built as a
+    PartialEmoji, because one constructed by hand carries no connection state
+    and can't be downloaded at all. The tradeoff is that an emoji from a server
+    the bot isn't in — someone pasting an external one — is skipped.
+    """
     images = {}
     for text in texts:
         for match in CUSTOM_EMOJI.finditer(text or ""):
             emoji_id = int(match.group(3))
             if emoji_id in images:
                 continue
+
+            # A cached None means we already tried and couldn't, so we neither
+            # retry it nor log about it again.
             if emoji_id in _custom_emoji_cache:
-                images[emoji_id] = _custom_emoji_cache[emoji_id]
+                cached = _custom_emoji_cache[emoji_id]
+                if cached is not None:
+                    images[emoji_id] = cached
                 continue
 
-            partial = discord.PartialEmoji(
-                name=match.group(2), id=emoji_id, animated=bool(match.group(1))
-            )
+            emoji = bot.get_emoji(emoji_id)
+            if emoji is None:
+                _custom_emoji_cache[emoji_id] = None
+                print(
+                    f"NOTE: emoji :{match.group(2)}: ({emoji_id}) isn't from a "
+                    "server I'm in, so it's left out of the image.",
+                    flush=True,
+                )
+                continue
+
             try:
-                data = await partial.read()
-            except (discord.HTTPException, discord.NotFound):
-                continue  # deleted, or from a server the bot can't see
+                data = await emoji.read()
+            except (discord.DiscordException, OSError) as error:
+                _custom_emoji_cache[emoji_id] = None
+                print(
+                    f"WARNING: couldn't download emoji {emoji_id}: {error!r}",
+                    flush=True,
+                )
+                continue
 
             _custom_emoji_cache[emoji_id] = data
             images[emoji_id] = data
@@ -1946,6 +1972,11 @@ async def start_live_summary(event: dict, fallback_channel, guild) -> None:
     guild_id = event["guild_id"]
     channel = live_summary_channel(guild_id, fallback_channel)
     if channel is None:
+        print(
+            f"WARNING: no channel to post the live summary for "
+            f"{event['title']!r} in.",
+            flush=True,
+        )
         return
 
     if guild_live_mode.get(guild_id, LIVE_EACH) == LIVE_LATEST:
@@ -1973,7 +2004,14 @@ async def start_live_summary(event: dict, fallback_channel, guild) -> None:
             live_summary_content(event, channel.id),
             file=discord.File(buffer, filename="rsvp_live.png"),
         )
-    except discord.HTTPException:
+    except discord.HTTPException as error:
+        # Almost always a missing permission in the target channel, which is
+        # worth naming rather than leaving as a summary that never appears.
+        print(
+            f"WARNING: couldn't post the live summary for {event['title']!r} "
+            f"in #{getattr(channel, 'name', channel.id)}: {error!r}",
+            flush=True,
+        )
         return
 
     event["live_message_id"] = message.id
@@ -2350,6 +2388,79 @@ async def closersvp(
     )
 
 
+@bot.tree.command(name="renamersvp", description="Change a running RSVP's title")
+@app_commands.describe(title="Which RSVP to rename", new_title="What to call it instead")
+@app_commands.autocomplete(title=rsvp_title_autocomplete)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def renamersvp(interaction: discord.Interaction, title: str, new_title: str):
+    found, problem = resolve_event(interaction.guild_id, title)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    event_id, event = found
+
+    wanted = new_title.strip()
+    if not wanted:
+        await interaction.response.send_message(
+            "Give it a title.", ephemeral=True
+        )
+        return
+
+    if wanted == event["title"]:
+        await interaction.response.send_message(
+            f"**{wanted}** is already its title.", ephemeral=True
+        )
+        return
+
+    # The title is how the other commands tell RSVPs apart, so the new one has
+    # to be free, exactly as it would be for a fresh /rsvp.
+    for other_id, other in events_for_guild(interaction.guild_id):
+        if other_id != event_id and other["title"].casefold() == wanted.casefold():
+            await interaction.response.send_message(
+                f"There's already an RSVP called **{other['title']}** running. "
+                "Pick something else.",
+                ephemeral=True,
+            )
+            return
+
+    await interaction.response.defer(ephemeral=True)
+
+    previous = event["title"]
+    event["title"] = wanted
+
+    # Every slot message carries the title, so each one has to be rewritten.
+    channel = bot.get_channel(event["channel_id"])
+    updated = 0
+    if channel is not None:
+        for slot in event["slots"].values():
+            message = channel.get_partial_message(slot["message_id"])
+            content = (
+                button_message_text(event, slot)
+                if event["mode"] == BUTTON_MODE
+                else slot_headline(event, slot)
+            )
+            try:
+                # `view` is left alone deliberately — a button RSVP keeps its
+                # buttons through a rename.
+                await message.edit(content=content)
+            except (discord.HTTPException, discord.NotFound):
+                continue
+            updated += 1
+
+    # The live summary has the title in both its caption and its image.
+    if event.get("live_message_id"):
+        run_in_background(refresh_live_summary(event_id))
+
+    save_state_soon()
+    await interaction.followup.send(
+        f"Renamed **{previous}** to **{wanted}**, and updated "
+        f"{updated} message{'' if updated == 1 else 's'}."
+        + ("\nIts live summary will catch up in a moment."
+           if event.get("live_message_id") else ""),
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="rsvps", description="List the RSVPs running on this server")
 async def rsvps(interaction: discord.Interaction):
     running = events_for_guild(interaction.guild_id)
@@ -2514,7 +2625,16 @@ async def rsvp(interaction: discord.Interaction, title: str, date: str = None):
         await reconcile_event(active_events[event_id], interaction.channel)
 
         if wants_live_summary(interaction.guild_id):
-            await start_live_summary(event, interaction.channel, interaction.guild)
+            # Deliberately broad: the live summary is a convenience, and it has
+            # no business taking the RSVP down with it if something in there
+            # fails. Whatever went wrong is named in the log.
+            try:
+                await start_live_summary(event, interaction.channel, interaction.guild)
+            except Exception as error:  # noqa: BLE001
+                print(
+                    f"WARNING: live summary failed for {title!r}: {error!r}",
+                    flush=True,
+                )
 
         save_state_soon()
 

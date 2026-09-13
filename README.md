@@ -92,6 +92,8 @@ Because it's an image rather than Discord markdown, it cannot localize per viewe
 
 Titles may contain your server's own emoji. They're downloaded and drawn inline at the right size, rather than appearing as the raw <:name:id> text Discord stores them as. Unicode emoji work too. Either kind is skipped rather than drawn as a broken box if it can't be fetched or rendered.
 
+Emoji are looked up through the bot's own cache, so one from a server the bot isn't in — an external emoji pasted by a Nitro user — is left out of the image and noted in the log.
+
 /rsvps
 
 Lists what's running on this server: each title, its date, how many slots and how many people have answered, which voting mode it uses, whether it has a live summary pinned, and the best turnout so far. Use a title from here with /summary or /reactping.
@@ -113,6 +115,12 @@ It redraws at most once every 4 seconds. Replacing a message's image means re-up
 cleanup — whether posting a new summary deletes the previous one, so the channel holds one instead of a growing pile. Off by default, since a deleted message can't be brought back. The new summary is posted first and the old one removed after, so the channel is never briefly left without one. Note that older RSVPs still running lose their live summary this way — /summary still works for them. In "follows the newest" mode this setting does nothing, because there's only ever one message to begin with.
 
 Turning the whole thing off leaves the image in place, marks it as no longer updating, and unpins it — unless cleanup is on, in which case it's deleted.
+
+/renamersvp <title> <new_title>
+
+Changes a running RSVP's title. Requires Manage Server permission.
+
+Every slot message is rewritten so the new title shows, and the live summary redraws with it. A button RSVP keeps its buttons. The new title has to be free, same as for a fresh /rsvp, since the title is how the other commands tell RSVPs apart.
 
 /closersvp <title> [delete_messages]
 
